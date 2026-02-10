@@ -4,7 +4,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+-- {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
@@ -25,6 +25,7 @@ module Data.Array.Accelerate.LLVM.PTX.Execute (
   {- instance Execute UniformSchedule PTXKernel -}
 ) where
 
+import Debug.Trace
 import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.Array.Buffer
 import Data.Array.Accelerate.AST.Idx
@@ -35,39 +36,40 @@ import Data.Array.Accelerate.AST.Schedule
 import Data.Array.Accelerate.AST.Schedule.Uniform
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Lifetime
-import Data.Array.Accelerate.Representation.Array
+-- import Data.Array.Accelerate.Representation.Array
 import Data.Array.Accelerate.Representation.Shape
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.Interpreter                            ( evalExp, EvalArrayInstr(..) )
 
-import Data.Array.Accelerate.LLVM.State
+-- import Data.Array.Accelerate.LLVM.State
 
 import Data.Array.Accelerate.LLVM.PTX.Execute.Buffer
-import Data.Array.Accelerate.LLVM.PTX.Execute.Environment
+-- import Data.Array.Accelerate.LLVM.PTX.Execute.Environment
 import Data.Array.Accelerate.LLVM.PTX.Execute.Par
 import Data.Array.Accelerate.LLVM.PTX.Kernel
-import Data.Array.Accelerate.LLVM.PTX.Execute.Stream (Stream)
-import qualified Data.Array.Accelerate.LLVM.PTX.Execute.Event       as Event
+-- import Data.Array.Accelerate.LLVM.PTX.Execute.Stream (Stream)
+-- import qualified Data.Array.Accelerate.LLVM.PTX.Execute.Event       as Event
 import Data.Array.Accelerate.LLVM.PTX.Link.Object
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph
 
 -- import Data.Array.Accelerate.LLVM.Execute
 
-import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch               ( multipleOf )
+-- import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch               ( multipleOf )
 -- import Data.Array.Accelerate.LLVM.PTX.Array.Data
 -- import Data.Array.Accelerate.LLVM.PTX.Array.Prim                    ( memsetArrayAsync )
 -- import Data.Array.Accelerate.LLVM.PTX.Execute.Async
--- import Data.Array.Accelerate.LLVM.PTX.Execute.Environment
+import Data.Array.Accelerate.LLVM.PTX.Execute.Environment
 -- import Data.Array.Accelerate.LLVM.PTX.Execute.Marshal
--- import Data.Array.Accelerate.LLVM.PTX.Execute.Stream                ( Stream )
+import Data.Array.Accelerate.LLVM.PTX.Execute.Stream                ( Stream )
 -- import Data.Array.Accelerate.LLVM.PTX.Link
-import Data.Array.Accelerate.LLVM.PTX.Target
+-- import Data.Array.Accelerate.LLVM.PTX.Target
 import Data.Array.Accelerate.LLVM.PTX.State
 -- import qualified Data.Array.Accelerate.LLVM.PTX.Debug               as Debug
--- import qualified Data.Array.Accelerate.LLVM.PTX.Execute.Event       as Event
+import qualified Data.Array.Accelerate.LLVM.PTX.Execute.Event       as Event
 
 import qualified Foreign.CUDA.Driver                                as CUDA
-import qualified Foreign.CUDA.Driver.Stream                         as CUDA
+-- import qualified Foreign.CUDA.Driver.Stream                         as CUDA
 
 import Control.Monad                                                ( forM_, when, unless )
 import Control.Monad.Reader                                         ( asks )
@@ -77,21 +79,65 @@ import Data.Maybe                                                   ( fromMaybe 
 import qualified Data.Text                                          as Text
 
 instance Execute UniformScheduleFun PTXKernel where
-  data Linked UniformScheduleFun PTXKernel t = PTXLinked (UniformScheduleFun PTXKernel () t)
+  data Linked UniformScheduleFun PTXKernel t = PTXLinked GraphProgram (UniformScheduleFun PTXKernel () t)
 
-  linkAfunSchedule = PTXLinked
+  linkAfunSchedule x = trace ("linking, " ++ show (linkProgram x)) $ PTXLinked (linkProgram x) x
 
-  executeAfunSchedule _ (PTXLinked f) = executeFun f
+  executeAfunSchedule _ (PTXLinked p f) = executeFun p f
 
-executeFun :: UniformScheduleFun PTXKernel () f -> IOFun f
-executeFun (Sbody _) = return ()
-executeFun (Slam lhs1 (Slam lhs2 f)) = \a -> \b ->
-  executeFun (Slam (LeftHandSidePair lhs1 lhs2) f) (a, b)
-executeFun (Slam lhs (Sbody body)) = \arguments -> evalPTX defaultTarget $ evalPar $ do
-  arguments' <- baseToValues (lhsToTupR lhs) arguments
-  let env = push' Empty (lhs, arguments')
-  execute env body
+executeFun :: GraphProgram -> UniformScheduleFun PTXKernel () f -> IOFun f
+executeFun _ (Sbody _) = return () -- empty program
+executeFun p (Slam lhs1 (Slam lhs2 f)) = curry (executeFun p (Slam (LeftHandSidePair lhs1 lhs2) f))
+executeFun p (Slam lhs (Sbody body)) = \arguments -> do
 
+  -- Block until received all inputs
+  -- TODO: Integrate into graph
+  -- awaitInput (lhsToTupR lhs) arguments
+
+  --Setup graph
+
+  inspectAllocSizes p (lhsToTupR lhs) arguments
+
+  -- Run graph
+
+  -- Unblock waiting outputs
+  -- TODO: Integrate into graph
+  -- resolveOutput (lhsToTupR lhs) arguments
+  -- return ()
+
+-- awaitInput :: TupR BaseR t -> t -> IO ()
+-- -- Unit
+-- awaitInput TupRunit _  = return ()
+-- -- Scalar input argument
+-- awaitInput (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRscalar tp))) (Signal mvar, Ref input) = readMVar mvar
+-- -- Buffer input argument
+-- awaitInput (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRbuffer tp))) (Signal mvar, Ref input) = readMVar mvar
+-- -- Scalar output argument
+-- awaitInput (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRscalar _))) (SignalResolver mvar, OutputRef output) = return ()
+-- -- Buffer output argument
+-- awaitInput (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRbuffer _))) (SignalResolver mvar, OutputRef output) = return ()
+-- -- Pair
+-- awaitInput (TupRpair t1 t2) (v1, v2) = do
+--   awaitInput t1 v1
+--   awaitInput t2 v2
+-- awaitInput _ _ = internalError "Unexpected types in the input or output of an Acc function"
+
+resolveOutput :: TupR BaseR t -> t -> IO ()
+-- Unit
+resolveOutput TupRunit _  = return ()
+-- Scalar input argument
+resolveOutput (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRscalar tp))) (Signal mvar, Ref input) = return ()
+-- Buffer input argument
+resolveOutput (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRbuffer tp))) (Signal mvar, Ref input) = return ()
+-- Scalar output argument
+resolveOutput (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRscalar _))) (SignalResolver mvar, OutputRef output) = putMVar mvar ()
+-- Buffer output argument
+resolveOutput (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRbuffer _))) (SignalResolver mvar, OutputRef output) = putMVar mvar ()
+-- Pair
+resolveOutput (TupRpair t1 t2) (v1, v2) = do
+  resolveOutput t1 v1
+  resolveOutput t2 v2
+resolveOutput _ _ = internalError "Unexpected types in the input or output of an Acc function"
 executeUnaryFun :: Gamma env -> UniformScheduleFun PTXKernel env (s -> ()) -> Distribute Value s -> Par ()
 executeUnaryFun env (Slam lhs (Sbody body)) arguments =
   let env' = push' env (lhs, arguments)
@@ -105,52 +151,53 @@ executeTernaryFun env (Slam lhs1 (Slam lhs2 f)) a b = executeBinaryFun env (Slam
 
 execute :: Gamma env -> UniformSchedule PTXKernel env -> Par ()
 execute env = \case
-  Return -> return ()
-  Alet lhs bnd next -> do
+  Return -> trace "\nreturn" $ return ()
+  Alet lhs bnd next -> trace "\nalet" $ do
     bnd' <- executeBinding env (lhsToTupR lhs) bnd
     let env' = push' env (lhs, bnd')
     execute env' next
-  Effect effect next -> do
+  Effect effect next -> trace "\neffect" $ do
     executeEffect env effect
     execute env next
-  Acond cond true false next -> do
-    let cond' = case prj' (varIdx cond) env of
-          ValueScalar _ c -> c
-    if cond' == 1 then
-      execute env true
-    else
-      execute env false
-    execute env next
-  Awhile io step initial next -> executeAwhile env io step (prjVars initial env) next
-  AwhileSeq io step initial next -> executeAwhileSeq env io step (prjVars initial env) next
-  Spawn a b -> do
+  -- Acond cond true false next -> do
+  --   let cond' = case prj' (varIdx cond) env of
+  --         ValueScalar _ c -> c
+  --   if cond' == 1 then
+  --     execute env true
+  --   else
+  --     execute env false
+  --   execute env next
+  -- Awhile io step initial next -> executeAwhile env io step (prjVars initial env) next
+  -- AwhileSeq io step initial next -> executeAwhileSeq env io step (prjVars initial env) next
+  Spawn a b -> trace "\nspawn" $ do
     spawnPar (execute env a)
     execute env b
+  _ -> undefined
 
 executeBinding :: Gamma env -> BasesR t -> Binding env t -> Par (Distribute Value t)
 executeBinding env baseTp = \case
-  Compute expr -> do
+  Compute expr -> trace "compute" $ do
     result <- evalExp expr $ evalArrayInstr env
     return $ scalarToValues (mapTupR expectScalarType baseTp) result
-  NewSignal _ -> do
+  NewSignal _ -> trace "new signal" $ do
     event <- liftPar $ Event.create
     let signal = PTXSignal event
     return (ValueSignal signal, ValueSignalResolver signal)
-  NewRef _ -> do
+  NewRef _ -> trace "new ref" $ do
     mvar <- liftIO newEmptyMVar
     return (ValueRef mvar, ValueOutputRef mvar)
-  Alloc shr tp sh -> do
+  Alloc shr tp sh -> trace "alloc" $ do
     let n = size' shr $ prjVars sh env
     ValueBuffer <$> mallocDevice tp n
-  Use tp _ buffer ->
+  Use tp _ buffer -> trace "use" $
     ValueBuffer <$> copyToDevice tp buffer
-  Unit var -> case prj' (varIdx var) env of
+  Unit var -> trace "unit" $ case prj' (varIdx var) env of
     ValueScalar tp value -> do
       mbuffer@(MutableBuffer buffer) <- liftIO $ newBuffer tp 1
       liftIO $ writeBuffer tp mbuffer 0 value
       ValueBuffer <$> copyToDevice tp (Buffer buffer)
     _ -> internalError "Buffer impossible"
-  RefRead ref -> case prj' (varIdx ref) env of
+  RefRead ref -> trace "ref read" $ case prj' (varIdx ref) env of
     ValueScalar _ _ -> internalError "Ref impossible"
     ValueRef mvar -> do
       value <- liftIO $ readMVar mvar
@@ -164,7 +211,7 @@ executeBinding env baseTp = \case
 executeEffect :: Gamma env -> Effect PTXKernel env -> Par ()
 executeEffect env = \case
   Exec _ kernelFun args
-    | Exists kernel <- kernelFunKernel kernelFun -> do
+    | Exists kernel <- kernelFunKernel kernelFun -> trace "kernel" $ do
       stream <- asks ptxStream
 
       -- Allocate kernel memory
@@ -216,7 +263,7 @@ executeEffect env = \case
     forM_ signals $ \signal -> case prj' signal env of
       ValueSignal (PTXSignal event) -> liftIO $ Event.after event stream
       ValueScalar _ _ -> internalError "Signal impossible"
-  SignalResolve signals -> do
+  SignalResolve signals -> trace "resolve" $ do
     stream <- asks ptxStream
     forM_ signals $ \signal -> case prj' signal env of
       ValueSignalResolver (PTXSignal event) -> liftIO $ Event.record event stream
@@ -224,7 +271,7 @@ executeEffect env = \case
   RefWrite refVar valueVar
     | ValueOutputRef mvar <- prj' (varIdx refVar) env
     , value <- prj' (varIdx valueVar) env
-    , Refl <- reprIsSingle @Value @_ @Value value -> do
+    , Refl <- reprIsSingle @Value @_ @Value value -> trace "refwrite" $ do
       liftIO $ putMVar mvar value
     | otherwise -> internalError "Ref or scalar impossible"
   Aassert msg cond -> do
