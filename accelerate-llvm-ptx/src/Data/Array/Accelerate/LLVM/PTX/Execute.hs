@@ -85,6 +85,7 @@ instance Execute UniformScheduleFun PTXKernel where
 
   executeAfunSchedule _ (PTXLinked p f) = executeFun p f
 
+
 executeFun :: GraphProgram -> UniformScheduleFun PTXKernel () f -> IOFun f
 executeFun _ (Sbody _) = return () -- empty program
 executeFun p (Slam lhs1 (Slam lhs2 f)) = curry (executeFun p (Slam (LeftHandSidePair lhs1 lhs2) f))
@@ -96,7 +97,7 @@ executeFun p (Slam lhs (Sbody body)) = \arguments -> do
 
   --Setup graph
 
-  inspectAllocSizes p (lhsToTupR lhs) arguments
+  runGraphProgram p (lhsToTupR lhs) arguments
 
   -- Run graph
 

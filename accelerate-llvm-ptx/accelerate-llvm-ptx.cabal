@@ -38,6 +38,10 @@ extra-source-files:
 -- -------------------
 
 Library
+  c-sources:
+      ./cbits/graph.c
+  cc-options: -O2 -Wall -Wextra -DCUDA_PRELOAD
+
   exposed-modules:
     Data.Array.Accelerate.LLVM.PTX
     Data.Array.Accelerate.LLVM.PTX.Foreign

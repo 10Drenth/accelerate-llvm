@@ -5,29 +5,28 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE NamedFieldPuns #-}
-module Data.Array.Accelerate.LLVM.PTX.Link.Graph (linkProgram, inspectAllocSizes, GraphProgram) where
+module Data.Array.Accelerate.LLVM.PTX.Link.Graph (linkProgram, runGraphProgram, GraphProgram) where
 
 import Data.Array.Accelerate.AST.Schedule.Uniform
 import Data.Array.Accelerate.LLVM.PTX.Kernel (PTXKernel)
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.AST.LeftHandSide
 import Data.Array.Accelerate.AST.Environment
-import Data.Array.Accelerate.Type (ScalarType, Word64)
+import Data.Array.Accelerate.Type (ScalarType)
 import Data.Array.Accelerate.Error (internalError)
 import qualified Data.Map as M
 import Data.Array.Accelerate.AST.Idx
-import Control.Concurrent (readMVar, putMVar)
+import Control.Concurrent (readMVar, putMVar, takeMVar, forkIO)
 import Data.IORef (readIORef, IORef, writeIORef)
 import Data.Array.Accelerate.Representation.Elt (showElt, bytesElt)
 import Data.Array.Accelerate.Array.Buffer (bufferToList, Buffer (Buffer), memoryByteSize, MutableBuffer (..), newBuffer, writeBuffer, indexBuffer)
 import Foreign
 import Data.Maybe (mapMaybe)
 import Data.Bifunctor
-import qualified Foreign.CUDA as DEVICE
 import qualified Foreign.CUDA.Driver as CUDA
 import qualified Foreign.CUDA.Driver.Graph.Build as Graph
-import qualified Foreign.CUDA.Driver.Graph.Exec as Exec
-import qualified Foreign.CUDA.Driver.Stream as Stream
+import GHC.Conc (PrimMVar, newStablePtrPrimMVar)
+import Control.Concurrent.MVar (newEmptyMVar, MVar)
 
 
 data GraphProgram = GraphProgram Nodes Allocations
@@ -45,6 +44,8 @@ instance Eq SomeAllocationIndex where
 instance Ord SomeAllocationIndex where
   (<=) :: SomeAllocationIndex -> SomeAllocationIndex -> Bool
   (SomeAllocationIndex _ l) <= (SomeAllocationIndex _ r) = l <= r
+aIdxToInt :: SomeAllocationIndex -> Int
+aIdxToInt (SomeAllocationIndex _ v) = v
 
 data AllocationIndex t where
   AllocationIndex :: Maybe t -> AllocationIndex t
@@ -256,8 +257,9 @@ withHostPointer f (BufferAllocation (Buffer fptr)) = withForeignPtr fptr (f . ca
 
 type InputValues = M.Map SomeAllocationIndex HostAllocation
 type OutputAllocations = M.Map SomeAllocationIndex HostAllocation
-type OutWrites = M.Map SomeAllocationIndex (OutputAllocations -> IO ())
+type OutWrites = M.Map SomeAllocationIndex (MVar () -> OutputAllocations -> IO ())
 type DeviceAllocations = M.Map SomeAllocationIndex (CUDA.DevicePtr Word8)
+
 
 allocateDeviceBuffers :: M.Map SomeAllocationIndex Int -> IO DeviceAllocations
 allocateDeviceBuffers = mapM CUDA.mallocArray
@@ -281,14 +283,22 @@ incrementIndex :: Pass1 -> Pass1
 incrementIndex p@(Pass1 {currentIndex}) = case currentIndex of
   (SomeAllocationIndex x i) -> p{currentIndex = SomeAllocationIndex x (i + 1)}
 
-inspectAllocSizes :: GraphProgram -> TupR BaseR t -> t -> IO ()
-inspectAllocSizes (GraphProgram n a) tup v = do
+foreign import ccall unsafe "run_graph" run_graph_c
+  :: Word32 -- Nodecount
+  -> Ptr Word32 -- Node dependency counts
+  -> Ptr (Ptr Word32) -- Node dependencies
+  -> Ptr Word32 -- Node contents
+  -> Word32 -- Alloc count
+  -> Ptr Word32 -- Alloc sizes
+  -> Ptr (Ptr Word8) -- Input data
+  -> Ptr (Ptr Word8) -- Output data
+  -> Ptr (StablePtr PrimMVar) -- Output mvars
+  -> StablePtr PrimMVar -- Done Mvar
+  -> IO ()
 
-  -- let ctx = unsafeGetValue $ deviceContext $ ptxContext defaultTarget
+runGraphProgram :: GraphProgram -> TupR BaseR t -> t -> IO ()
+runGraphProgram (GraphProgram n a) tup v = do
 
-  CUDA.initialise []
-  dev0 <- CUDA.device 0
-  ctx <- CUDA.create dev0 []
   p1 <- inspectInputAllocSizes tup v $ Pass1
     { currentIndex = SomeAllocationIndex (AllocationIndex Nothing) 0
     , inputSizes = M.empty
@@ -299,52 +309,137 @@ inspectAllocSizes (GraphProgram n a) tup v = do
   putStrLn $ "Input sizes: \n" ++ prettyPrintMap (inputSizes p1)
   let bytesizes = propagateAllocSizes a (inputSizes p1)
   putStrLn $ "Propagated sizes: \n" ++ prettyPrintMap bytesizes
-  deviceAllocations <- allocateDeviceBuffers bytesizes
+  -- deviceAllocations <- allocateDeviceBuffers bytesizes
 
   outputBuffers <- allocateHostOutBuffers bytesizes
 
-  graph <- Graph.create []
+  doneMVar <- newEmptyMVar
+  doneMVarPtr <- newStablePtrPrimMVar doneMVar
 
-  let f :: M.Map NodeIndex Graph.Node -> NodeContent -> IO Graph.Node
-      f acc (EmptyNode deps) = Graph.addEmpty graph (mapMaybe (acc M.!?) deps)
-      f _   (Input alloc) = let
-        byteSize = bytesizes M.! getIdx alloc
-        input = inputValues p1 M.! getIdx alloc
-        inputDevicePtr = CUDA.useDevicePtr $ CUDA.castDevPtr $ deviceAllocations M.! getIdx alloc
-        in withHostPointer (\inputHostPtr -> Graph.addMemcpy graph [] ctx
-          0 0 0 0 CUDA.HostMemory inputHostPtr byteSize 1
-          0 0 0 0 CUDA.DeviceMemory inputDevicePtr byteSize 1
-          byteSize 1 1) input
-      f acc (Output alloc deps) = let
-        depInstances = mapMaybe (acc M.!?) deps
-        byteSize = bytesizes M.! getIdx alloc
-        output = outputBuffers M.! getIdx alloc
-        outputDevicePtr = CUDA.useDevicePtr $ CUDA.castDevPtr $ deviceAllocations M.! getIdx alloc
-        in withHostPointer (\outputHostPtr -> Graph.addMemcpy graph depInstances ctx
-          0 0 0 0 CUDA.DeviceMemory outputDevicePtr byteSize 1
-          0 0 0 0 CUDA.HostMemory outputHostPtr byteSize 1
-          byteSize 1 1) output
-      f acc (CopyNode deps idxIn idxOut) = let
-        depInstances = mapMaybe (acc M.!?) deps
-        byteSizeIn = bytesizes M.! idxIn
-        byteSizeOut = bytesizes M.! idxOut
-        devPtrIn = CUDA.useDevicePtr $ CUDA.castDevPtr $ deviceAllocations M.! idxIn
-        devPtrOut = CUDA.useDevicePtr $ CUDA.castDevPtr $ deviceAllocations M.! idxOut
-        in Graph.addMemcpy graph depInstances ctx
-          0 0 0 0 CUDA.DeviceMemory devPtrIn byteSizeIn 1
-          0 0 0 0 CUDA.DeviceMemory devPtrOut byteSizeOut 1
-          byteSizeOut 1 1
+  let
+    node_count = M.size n
+    n_nodes_c = (fromIntegral node_count :: Word32)
+    bytesizes' = [fromIntegral (bytesizes M.! SomeAllocationIndex (AllocationIndex Nothing) i) | i <- [0..(alloc_count-1)]]
+    alloc_count = M.size a
+    alloc_count_c = (fromIntegral alloc_count :: Word32)
+    (node_dependency_counts, node_dependencies) = getNodeDependencies n
 
-  graph' <- constructGraph n f graph M.empty
+  node_dependency_counts_fp <- mallocForeignPtrArray node_count
+  node_contents_fp <- mallocForeignPtrArray $ node_count * 4
+  bytesizes_fp <- mallocForeignPtrArray alloc_count
+  input_data_fp <- mallocForeignPtrArray (M.size $ inputSizes p1)
+  output_data_fp <- mallocForeignPtrArray alloc_count
+  output_mvars_fp <- mallocForeignPtrArray alloc_count
 
 
+  withDeps node_dependencies $ \deps -> do
+    node_deps_fp <- mallocForeignPtrArray node_count
 
-  exec <- Exec.instantiate graph'
-  Exec.launch exec Stream.defaultStream
+    withForeignPtr node_deps_fp $ \nodes_deps_c -> do
+      pokeArray nodes_deps_c deps
 
-  DEVICE.sync
+      withForeignPtr node_dependency_counts_fp $ \node_dependency_counts_c -> do
+        pokeArray node_dependency_counts_c node_dependency_counts
 
-  mapM_ (\op -> op outputBuffers) $ outputWriteOps p1
+        withForeignPtr node_contents_fp $ \node_contents_c -> do
+          mapM_ (\nid -> writeNodeContents nid (n M.! NodeIndex nid) node_contents_c) [0..(node_count-1)]
+
+          withForeignPtr bytesizes_fp $ \bytesizes_c -> do
+            pokeArray bytesizes_c bytesizes'
+
+            withFps (map getHostAllocFp (ascElems (inputValues p1))) $ \input_data_ptrs -> do
+              withForeignPtr input_data_fp $ \input_data_c -> do
+                pokeArray input_data_c input_data_ptrs
+                withFps (map getHostAllocFp (ascElems outputBuffers)) $ \output_data_ptrs -> do
+                  withForeignPtr output_mvars_fp $ \output_mvars_c -> do
+                    -- TODO instantiate mvars
+                    -- mvars <- mapM (const newEmptyMVar) (M.elems a)
+                    mvars <- mapM (\aid -> do
+                        mvar <- newEmptyMVar
+                        case outputWriteOps p1 M.!? aid of
+                          (Just op) -> op mvar outputBuffers
+                          Nothing -> return ()
+                        return mvar
+                        ) (M.keys a)
+                    mvarPtrs <- mapM newStablePtrPrimMVar mvars
+                    pokeArray output_mvars_c mvarPtrs
+
+                    withForeignPtr output_data_fp $ \output_data_c -> do
+                      pokeArray output_data_c output_data_ptrs
+                      putStrLn "Values before c:"
+                      -- mapM_ (\(ptr, size) -> do 
+                      --     val <- peek ptr
+                      --     print val
+                      --     return ()
+                      --   ) 
+                      --   (zip input_data_ptrs (ascElems (inputSizes p1)))
+
+                      run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c node_contents_c alloc_count_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
+                      putStrLn "waiting.."
+                      _ <- takeMVar doneMVar
+                      putStrLn "Done!"
+                      mapM_ (`putMVar` ()) mvars
+                      putStrLn "Done resolving outputs!"
+
+
+
+  return ()
+
+ascElems :: Ord a => M.Map a b -> [b]
+ascElems = map snd . M.toAscList
+
+getHostAllocFp :: HostAllocation -> ForeignPtr Word8
+getHostAllocFp (ScalarAllocation (Buffer fptr)) = castForeignPtr fptr
+getHostAllocFp (BufferAllocation (Buffer fptr)) = castForeignPtr fptr
+
+
+writeNodeContents :: Int -> NodeContent -> Ptr Word32 -> IO ()
+writeNodeContents idx nodeContent ptr = case nodeContent of
+  (CopyNode _ a1 a2) -> do
+    pokeType 0
+    pokeA1 a1
+    pokeA2 a2
+  (Input a) -> do
+    pokeType 1
+    pokeA1 (getIdx a)
+  (Output a _) -> do
+    pokeType 2
+    pokeA1 (getIdx a)
+  (EmptyNode _) -> do
+    pokeType 3
+  where
+    cursor0 = idx * 4
+    cursor1 = cursor0 + 1
+    cursor2 = cursor0 + 2
+    pokeType = pokeElemOff ptr cursor0
+    pokeA1 = pokeElemOff ptr cursor1 . fromIntegral . aIdxToInt
+    pokeA2 = pokeElemOff ptr cursor2 . fromIntegral . aIdxToInt
+
+withDeps :: Storable a => [[a]] -> ([Ptr a] -> IO b) -> IO b
+withDeps xs op = do
+  fps <- traverse (mallocForeignPtrArray . length) xs
+  xs' <- mapM (\(fp, es) -> withForeignPtr fp (\ptr -> do pokeArray ptr es; return ptr)) (zip fps xs)
+  op xs'
+
+withFps :: [ForeignPtr a] -> ([Ptr a] -> IO b) -> IO b
+withFps fps op = do
+  xs' <- mapM (`withForeignPtr` return) fps
+  op xs'
+
+getNodeDependencies :: Nodes -> ([Word32] ,[[Word32]])
+getNodeDependencies n = let
+  deps = map (\(_, v) -> map (\(NodeIndex i) -> fromIntegral i) $ getDeps v) $ M.toAscList n
+  n_deps = map (fromIntegral . length) deps
+  in (n_deps, deps)
+
+
+
+  -- exec <- Exec.instantiate graph'
+  -- Exec.launch exec Stream.defaultStream
+
+  -- DEVICE.sync
+
+  -- mapM_ (\op -> op outputBuffers) $ outputWriteOps p1
 
 constructGraph :: Nodes -> (M.Map NodeIndex Graph.Node -> NodeContent -> IO Graph.Node) -> Graph.Graph -> M.Map NodeIndex Graph.Node -> IO Graph.Graph
 constructGraph ns f graph instances =
@@ -399,20 +494,30 @@ inspectInputAllocSizes (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (
 -- Scalar output argument
 inspectInputAllocSizes (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRscalar tp))) (SignalResolver mvar, OutputRef output) p = do
   let
-    f :: OutputAllocations -> IO ()
-    f outBufs = do
-     writeOutputScalar (currentIndex p) tp output outBufs
-     putMVar mvar ()
+    f :: MVar () -> OutputAllocations -> IO ()
+    f mvar' outBufs = do
+      _ <- forkIO $ do
+        putStrLn "HASKELL Starting the wait for scalar MVAR!"
+        _ <- takeMVar mvar'
+        putStrLn "HASKELL scalar MVAR Done!"
+        writeOutputScalar (currentIndex p) tp output outBufs
+        putMVar mvar ()
+      return ()
 
   let writes' = M.insert (currentIndex p) f (outputWriteOps p)
   return (incrementIndex (Pass1 {currentIndex = currentIndex p, inputSizes = inputSizes p, inputValues = inputValues p, outputWriteOps = writes'}))
 -- Buffer output argument
 inspectInputAllocSizes (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRbuffer _))) (SignalResolver mvar, OutputRef output) p = do
   let
-    f :: OutputAllocations -> IO ()
-    f outBufs = do
-     writeOutputBuffer (currentIndex p) output outBufs
-     putMVar mvar ()
+    f :: MVar () -> OutputAllocations -> IO ()
+    f mvar' outBufs = do
+      _ <- forkIO $ do
+        putStrLn "HASKELL Starting the wait for buffer MVAR!"
+        _ <- takeMVar mvar'
+        putStrLn "HASKELL buffer MVAR Done!"
+        writeOutputBuffer (currentIndex p) output outBufs
+        putMVar mvar ()
+      return ()
 
   let writes' = M.insert (currentIndex p) f (outputWriteOps p)
   return (incrementIndex (Pass1 {currentIndex = currentIndex p, inputSizes = inputSizes p, inputValues = inputValues p, outputWriteOps = writes'}))
