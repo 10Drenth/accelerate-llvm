@@ -3,7 +3,6 @@
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE NamedFieldPuns #-}
 module Data.Array.Accelerate.LLVM.PTX.Link.Graph (linkProgram, runGraphProgram, GraphProgram) where
 
@@ -23,47 +22,33 @@ import Data.Array.Accelerate.Array.Buffer (bufferToList, Buffer (Buffer), memory
 import Foreign
 import Data.Maybe (mapMaybe)
 import Data.Bifunctor
-import qualified Foreign.CUDA.Driver as CUDA
-import qualified Foreign.CUDA.Driver.Graph.Build as Graph
 import GHC.Conc (PrimMVar, newStablePtrPrimMVar)
 import Control.Concurrent.MVar (newEmptyMVar, MVar)
 
 
 data GraphProgram = GraphProgram Nodes Allocations
 
-newtype NodeIndex = NodeIndex Int
+newtype NIndex = NodeIndex Int
   deriving (Eq, Ord)
--- newtype AllocationIndex = AllocationIndex Int
---   deriving (Eq, Ord)
-data SomeAllocationIndex where
-  SomeAllocationIndex :: AllocationIndex t -> Int -> SomeAllocationIndex
-  -- deriving (Eq, Ord)
-instance Eq SomeAllocationIndex where
-  (==) :: SomeAllocationIndex -> SomeAllocationIndex -> Bool
-  (SomeAllocationIndex _ l) == (SomeAllocationIndex _ r) = l == r
-instance Ord SomeAllocationIndex where
-  (<=) :: SomeAllocationIndex -> SomeAllocationIndex -> Bool
-  (SomeAllocationIndex _ l) <= (SomeAllocationIndex _ r) = l <= r
-aIdxToInt :: SomeAllocationIndex -> Int
-aIdxToInt (SomeAllocationIndex _ v) = v
-
-data AllocationIndex t where
-  AllocationIndex :: Maybe t -> AllocationIndex t
+newtype AIndex = AIndex Int
+  deriving (Eq, Ord)
+aIdxToInt :: AIndex -> Int
+aIdxToInt (AIndex v) = v
 
 newtype EventIndex = EventIndex Int
   deriving (Eq, Ord, Show)
 
-type Nodes = M.Map NodeIndex NodeContent
-type Allocations = M.Map SomeAllocationIndex [SomeAllocationIndex]
+type Nodes = M.Map NIndex NContent
+type Allocations = M.Map AIndex [AIndex]
 
-data EventContents = EventContents [NodeIndex] -- Incoming
-                                   [NodeIndex] -- Outgoing
+data EventContents = EventContents [NIndex] -- Incoming
+                                   [NIndex] -- Outgoing
 type Events = M.Map EventIndex EventContents
 
 data LHSNode t where
-  LHSNodeStart :: NodeIndex -> LHSNode Signal
-  LHSNodeEnd :: NodeIndex -> LHSNode SignalResolver
-  LHSNodeType :: SomeAllocationIndex -> ScalarType e -> LHSNode t
+  LHSNodeStart :: NIndex -> LHSNode Signal
+  LHSNodeEnd :: NIndex -> LHSNode SignalResolver
+  LHSNodeType :: AIndex -> ScalarType e -> LHSNode t
   LHSNodeSignal :: EventIndex -> LHSNode Signal
   LHSNodeResolver :: EventIndex -> LHSNode SignalResolver
 instance Show (LHSNode t) where
@@ -73,36 +58,31 @@ instance Show (LHSNode t) where
   show (LHSNodeSignal idx) = "SignalNode: " ++ show idx
   show (LHSNodeResolver idx) = "ResolverNode" ++ show idx
 
-data NodeContent = CopyNode [NodeIndex] -- Dependencies
-                            SomeAllocationIndex -- From
-                            SomeAllocationIndex -- To
-                 | Input InOutAllocation
-                 | Output InOutAllocation [NodeIndex] -- Dependencies
-                 | EmptyNode [NodeIndex] -- Dependencies
+data NContent = CopyNode [NIndex] -- Dependencies
+                            AIndex -- From
+                            AIndex -- To
+                 | Input AIndex
+                 | Output AIndex [NIndex] -- Dependencies
+                 | EmptyNode [NIndex] -- Dependencies
+                 | AllocNode Int -- Element bytesize
+                             [AIndex] -- dims
+                             [NIndex] -- Dependencies 
   deriving (Show)
 
-data InOutAllocation = AScalar SomeAllocationIndex | ABuffer SomeAllocationIndex
-  deriving (Show)
-
-getIdx :: InOutAllocation -> SomeAllocationIndex
-getIdx (AScalar idx) = idx
-getIdx (ABuffer idx) = idx
-
-addDeps :: NodeContent -> [NodeIndex] -> NodeContent
+addDeps :: NContent -> [NIndex] -> NContent
 addDeps (EmptyNode deps) = EmptyNode . (deps ++ )
 addDeps (Output a deps) = Output a . (deps ++ )
 addDeps (CopyNode deps f t) = \d -> CopyNode (deps ++ d) f t
 addDeps (Input a) = const $ Input a
+addDeps (AllocNode bs dims deps) = AllocNode bs dims . (deps ++)
 
 
-getDeps :: NodeContent -> [NodeIndex]
+getDeps :: NContent -> [NIndex]
 getDeps (EmptyNode deps) = deps
 getDeps (Output _ deps) = deps
 getDeps (CopyNode deps _ _) = deps
 getDeps (Input _) = []
-
--- data Exists2 f where
---   Exists2 :: f a b -> Exists2 f
+getDeps (AllocNode _ _ deps) = deps
 
 linkProgram :: UniformScheduleFun PTXKernel () f -> GraphProgram
 linkProgram = convertFun
@@ -116,7 +96,7 @@ convertFun (Slam lhs (Sbody body)) = let
   (m', a', _) = convertBody lhsenv body [] m a M.empty
   in GraphProgram m' a'
 
-convertBody :: Env LHSNode env -> UniformSchedule PTXKernel env -> [NodeIndex] -> Nodes -> Allocations -> Events -> (Nodes, Allocations, Events)
+convertBody :: Env LHSNode env -> UniformSchedule PTXKernel env -> [NIndex] -> Nodes -> Allocations -> Events -> (Nodes, Allocations, Events)
 convertBody _ Return _ m a e = (m, a, e)
 convertBody env (Spawn l r) deps m a e = let
   (m', a', e') = convertBody env l deps m a e
@@ -139,25 +119,25 @@ convertBody env (Alet lhs (NewSignal _) next) deps m a e = let
   in convertBody env' next deps m a e'
 
 convertBody env (Alet lhs (RefRead rref) (Effect (RefWrite wref _) next)) deps m a e = let
-  idxIn :: SomeAllocationIndex
+  idxIn :: AIndex
   idxIn = case prj' (varIdx rref) env of (LHSNodeType idx _) -> idx
   env' = push' env (lhs, undefined) -- It will only be read here
 
-  idxOut :: SomeAllocationIndex
+  idxOut :: AIndex
   idxOut = case prj' (varIdx wref) env' of (LHSNodeType idx _) -> idx
 
   a' = M.adjust (idxIn :) idxOut a
-  nIdx :: NodeIndex
+  nIdx :: NIndex
   nIdx = NodeIndex $ M.size m
   m' = M.insert nIdx (CopyNode deps idxIn idxOut) m
 
   in convertBody env' next [nIdx] m' a' e
 convertBody _ _ _ _ _ _ = internalError "Unexpected body contents in schedule. Currently on handles Identity functions"
 
-getDependenciesFromEnv :: Env LHSNode env -> [NodeIndex] -> [Idx env Signal] -> Events -> ([NodeIndex], Events)
+getDependenciesFromEnv :: Env LHSNode env -> [NIndex] -> [Idx env Signal] -> Events -> ([NIndex], Events)
 getDependenciesFromEnv env deps ss e = (concatMap (\idx -> f $ prj' idx env) ss, updatedEvents)
   where
-    f :: LHSNode Signal -> [NodeIndex]
+    f :: LHSNode Signal -> [NIndex]
     f (LHSNodeStart i) = [i]
     f (LHSNodeSignal i) = case e M.! i of EventContents ns _ -> ns
     f _ = error "unreachable"
@@ -169,12 +149,12 @@ getDependenciesFromEnv env deps ss e = (concatMap (\idx -> f $ prj' idx env) ss,
     f' (LHSNodeSignal i) m = M.adjust (\(EventContents i' o') -> EventContents (deps ++ i') o') i m
     f' _ m = m
 
-getForwardDependenciesFromEnv :: Env LHSNode env -> [NodeIndex] -> [Idx env SignalResolver] -> Events -> ([NodeIndex], Events)
+getForwardDependenciesFromEnv :: Env LHSNode env -> [NIndex] -> [Idx env SignalResolver] -> Events -> ([NIndex], Events)
 getForwardDependenciesFromEnv env deps ss e = (concatMap (\idx -> f $ prj' idx env) ss, updatedEvents)
   where
 
 
-    f :: LHSNode SignalResolver -> [NodeIndex]
+    f :: LHSNode SignalResolver -> [NIndex]
     f (LHSNodeEnd i) = [i]
     f (LHSNodeResolver i) = case e M.! i of EventContents _ ns -> ns
     f _ = error "unreachable"
@@ -191,38 +171,38 @@ convertLHS :: t -> BasesR t -> Nodes -> Allocations -> (Distribute LHSNode t, No
 convertLHS _ TupRunit m a = ((), m, a)
 -- Scalar input argument
 convertLHS _ (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRscalar tp))) m a =
-  let alloc = SomeAllocationIndex (AllocationIndex Nothing) $ M.size a in
+  let alloc = AIndex $ M.size a in
   ( ( LHSNodeStart (NodeIndex (M.size m))
-    , LHSNodeType (SomeAllocationIndex (AllocationIndex Nothing) (M.size a)) tp
+    , LHSNodeType (AIndex (M.size a)) tp
     )
-  , M.insert (NodeIndex $ M.size m) (Input $ AScalar alloc) m
+  , M.insert (NodeIndex $ M.size m) (Input alloc) m
   , M.insert alloc [] a
   )
 -- Buffer input argument
 convertLHS _ (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRbuffer tp))) m a =
-  let alloc = SomeAllocationIndex (AllocationIndex Nothing) $ M.size a in
+  let alloc = AIndex $ M.size a in
   ( ( LHSNodeStart (NodeIndex (M.size m))
-    , LHSNodeType (SomeAllocationIndex (AllocationIndex Nothing) (M.size a)) tp
+    , LHSNodeType (AIndex (M.size a)) tp
     )
-  , M.insert (NodeIndex $ M.size m) (Input $ ABuffer alloc) m
+  , M.insert (NodeIndex $ M.size m) (Input alloc) m
   , M.insert alloc [] a
   )
 -- Scalar output argument
 convertLHS _ (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRscalar tp))) m a =
-  let alloc = SomeAllocationIndex (AllocationIndex Nothing) $ M.size a in
+  let alloc = AIndex $ M.size a in
   ( ( LHSNodeEnd (NodeIndex (M.size m))
-    , LHSNodeType (SomeAllocationIndex (AllocationIndex Nothing) (M.size a)) tp
+    , LHSNodeType (AIndex (M.size a)) tp
     )
-  , M.insert (NodeIndex $ M.size m) (Output (AScalar alloc) []) m
+  , M.insert (NodeIndex $ M.size m) (Output alloc []) m
   , M.insert alloc [] a
   )
 -- Buffer output argument
 convertLHS  _ (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRbuffer tp))) m a =
-  let alloc = SomeAllocationIndex (AllocationIndex Nothing) $ M.size a in
+  let alloc = AIndex $ M.size a in
   ( ( LHSNodeEnd (NodeIndex (M.size m))
-    , LHSNodeType (SomeAllocationIndex (AllocationIndex Nothing) (M.size a)) tp
+    , LHSNodeType (AIndex (M.size a)) tp
     )
-  , M.insert (NodeIndex $ M.size m) (Output (ABuffer alloc) []) m
+  , M.insert (NodeIndex $ M.size m) (Output alloc []) m
   , M.insert alloc [] a
   )
 -- Pair
@@ -242,29 +222,22 @@ instance Show GraphProgram where
 prettyPrintMap :: (Ord k, Show k, Show v) => M.Map k v -> String
 prettyPrintMap m = unlines $ map (\k -> show k ++ ": " ++ show (m M.! k)) $ M.keys m
 
-instance Show NodeIndex where
+instance Show NIndex where
   show (NodeIndex i) = "n" ++ show i
-instance Show SomeAllocationIndex where
-  show (SomeAllocationIndex _ i) = "d" ++ show i
+instance Show AIndex where
+  -- show (SomeAllocationIndex _ i) = "d" ++ show i
+  show (AIndex i) = "d" ++ show i
 
 data HostAllocation where
   ScalarAllocation :: Buffer t -> HostAllocation
   BufferAllocation :: Buffer t -> HostAllocation
 
-withHostPointer :: (Ptr a -> IO b) -> HostAllocation -> IO b
-withHostPointer f (ScalarAllocation (Buffer fptr)) = withForeignPtr fptr (f . castPtr)
-withHostPointer f (BufferAllocation (Buffer fptr)) = withForeignPtr fptr (f . castPtr)
-
-type InputValues = M.Map SomeAllocationIndex HostAllocation
-type OutputAllocations = M.Map SomeAllocationIndex HostAllocation
-type OutWrites = M.Map SomeAllocationIndex (MVar () -> OutputAllocations -> IO ())
-type DeviceAllocations = M.Map SomeAllocationIndex (CUDA.DevicePtr Word8)
+type InputValues = M.Map AIndex HostAllocation
+type OutputAllocations = M.Map AIndex HostAllocation
+type OutWrites = M.Map AIndex (MVar () -> OutputAllocations -> IO ())
 
 
-allocateDeviceBuffers :: M.Map SomeAllocationIndex Int -> IO DeviceAllocations
-allocateDeviceBuffers = mapM CUDA.mallocArray
-
-allocateHostOutBuffers :: M.Map SomeAllocationIndex Int -> IO OutputAllocations
+allocateHostOutBuffers :: M.Map AIndex Int -> IO OutputAllocations
 allocateHostOutBuffers = mapM f
   where
     f :: Int -> IO HostAllocation
@@ -273,15 +246,15 @@ allocateHostOutBuffers = mapM f
       return $ BufferAllocation (Buffer ptr)
 
 data Pass1 = Pass1
-           { currentIndex :: SomeAllocationIndex
-           , inputSizes :: M.Map SomeAllocationIndex Int
+           { currentIndex :: AIndex
+           , inputSizes :: M.Map AIndex Int
            , inputValues :: InputValues
            , outputWriteOps :: OutWrites
            }
 
 incrementIndex :: Pass1 -> Pass1
 incrementIndex p@(Pass1 {currentIndex}) = case currentIndex of
-  (SomeAllocationIndex x i) -> p{currentIndex = SomeAllocationIndex x (i + 1)}
+  (AIndex i) -> p{currentIndex = AIndex (i + 1)}
 
 foreign import ccall unsafe "run_graph" run_graph_c
   :: Word32 -- Nodecount
@@ -300,7 +273,7 @@ runGraphProgram :: GraphProgram -> TupR BaseR t -> t -> IO ()
 runGraphProgram (GraphProgram n a) tup v = do
 
   p1 <- inspectInputAllocSizes tup v $ Pass1
-    { currentIndex = SomeAllocationIndex (AllocationIndex Nothing) 0
+    { currentIndex = AIndex 0
     , inputSizes = M.empty
     , inputValues = M.empty
     , outputWriteOps = M.empty
@@ -309,7 +282,6 @@ runGraphProgram (GraphProgram n a) tup v = do
   putStrLn $ "Input sizes: \n" ++ prettyPrintMap (inputSizes p1)
   let bytesizes = propagateAllocSizes a (inputSizes p1)
   putStrLn $ "Propagated sizes: \n" ++ prettyPrintMap bytesizes
-  -- deviceAllocations <- allocateDeviceBuffers bytesizes
 
   outputBuffers <- allocateHostOutBuffers bytesizes
 
@@ -319,10 +291,11 @@ runGraphProgram (GraphProgram n a) tup v = do
   let
     node_count = M.size n
     n_nodes_c = (fromIntegral node_count :: Word32)
-    bytesizes' = [fromIntegral (bytesizes M.! SomeAllocationIndex (AllocationIndex Nothing) i) | i <- [0..(alloc_count-1)]]
+    bytesizes' = [fromIntegral (bytesizes M.! AIndex i) | i <- [0..(alloc_count-1)]]
     alloc_count = M.size a
     alloc_count_c = (fromIntegral alloc_count :: Word32)
     (node_dependency_counts, node_dependencies) = getNodeDependencies n
+    n_outputs = M.size (outputWriteOps p1)
 
   node_dependency_counts_fp <- mallocForeignPtrArray node_count
   node_contents_fp <- mallocForeignPtrArray $ node_count * 4
@@ -352,8 +325,6 @@ runGraphProgram (GraphProgram n a) tup v = do
                 pokeArray input_data_c input_data_ptrs
                 withFps (map getHostAllocFp (ascElems outputBuffers)) $ \output_data_ptrs -> do
                   withForeignPtr output_mvars_fp $ \output_mvars_c -> do
-                    -- TODO instantiate mvars
-                    -- mvars <- mapM (const newEmptyMVar) (M.elems a)
                     mvars <- mapM (\aid -> do
                         mvar <- newEmptyMVar
                         case outputWriteOps p1 M.!? aid of
@@ -366,14 +337,9 @@ runGraphProgram (GraphProgram n a) tup v = do
 
                     withForeignPtr output_data_fp $ \output_data_c -> do
                       pokeArray output_data_c output_data_ptrs
-                      putStrLn "Values before c:"
-                      -- mapM_ (\(ptr, size) -> do 
-                      --     val <- peek ptr
-                      --     print val
-                      --     return ()
-                      --   ) 
-                      --   (zip input_data_ptrs (ascElems (inputSizes p1)))
 
+
+                      putStrLn "starting C runtime from haskell.."
                       run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c node_contents_c alloc_count_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
                       putStrLn "waiting.."
                       _ <- takeMVar doneMVar
@@ -393,7 +359,7 @@ getHostAllocFp (ScalarAllocation (Buffer fptr)) = castForeignPtr fptr
 getHostAllocFp (BufferAllocation (Buffer fptr)) = castForeignPtr fptr
 
 
-writeNodeContents :: Int -> NodeContent -> Ptr Word32 -> IO ()
+writeNodeContents :: Int -> NContent -> Ptr Word32 -> IO ()
 writeNodeContents idx nodeContent ptr = case nodeContent of
   (CopyNode _ a1 a2) -> do
     pokeType 0
@@ -401,12 +367,13 @@ writeNodeContents idx nodeContent ptr = case nodeContent of
     pokeA2 a2
   (Input a) -> do
     pokeType 1
-    pokeA1 (getIdx a)
+    pokeA1 a
   (Output a _) -> do
     pokeType 2
-    pokeA1 (getIdx a)
+    pokeA1 a
   (EmptyNode _) -> do
     pokeType 3
+  (AllocNode {}) -> undefined
   where
     cursor0 = idx * 4
     cursor1 = cursor0 + 1
@@ -432,25 +399,6 @@ getNodeDependencies n = let
   n_deps = map (fromIntegral . length) deps
   in (n_deps, deps)
 
-
-
-  -- exec <- Exec.instantiate graph'
-  -- Exec.launch exec Stream.defaultStream
-
-  -- DEVICE.sync
-
-  -- mapM_ (\op -> op outputBuffers) $ outputWriteOps p1
-
-constructGraph :: Nodes -> (M.Map NodeIndex Graph.Node -> NodeContent -> IO Graph.Node) -> Graph.Graph -> M.Map NodeIndex Graph.Node -> IO Graph.Graph
-constructGraph ns f graph instances =
-  if M.null ns then return graph
-  else let unblockedNodes = M.filter (all (`M.member` instances) . getDeps) ns in
-    if M.null unblockedNodes then return graph
-    else do
-      newInstances <- mapM (f instances) unblockedNodes
-
-      constructGraph (M.difference ns newInstances) f graph (M.union instances newInstances)
-
 inspectInputAllocSizes :: TupR BaseR t -> t -> Pass1 -> IO Pass1
 -- Unit
 inspectInputAllocSizes TupRunit _ p = return p
@@ -462,10 +410,7 @@ inspectInputAllocSizes (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (
   let byteSize = max 1 (bytesElt (TupRsingle tp))
   mbuffer@(MutableBuffer buffer) <- newBuffer tp 1
   writeBuffer tp mbuffer 0 val
-  -- ValueBuffer <$> copyToDevice tp (Buffer buffer)
-  -- inputHostPtr <- Foreign.mallocBytes byteSize -- :: IO (Ptr t)
   let vs' = M.insert (currentIndex p) (ScalarAllocation (Buffer buffer)) (inputValues p)
-  -- Foreign.poke inputHostPtr val
 
   putStrLn "Input scalar value:"
   putStrLn $ "type: " ++ show tp ++ ", bytesize: " ++ show byteSize
@@ -527,19 +472,19 @@ inspectInputAllocSizes (TupRpair t1 t2) (v1, v2) p = do
   inspectInputAllocSizes t2 v2 p'
 inspectInputAllocSizes _ _  _ = internalError "Unexpected types in the input or output of an Acc function"
 
-writeOutputScalar :: SomeAllocationIndex -> ScalarType e -> IORef e -> M.Map SomeAllocationIndex HostAllocation -> IO ()
+writeOutputScalar :: AIndex -> ScalarType e -> IORef e -> M.Map AIndex HostAllocation -> IO ()
 writeOutputScalar idx tp ref m = let buf = getValue idx m in writeIORef ref (indexBuffer tp buf 0)
 
-writeOutputBuffer :: SomeAllocationIndex -> IORef (Buffer e) -> M.Map SomeAllocationIndex HostAllocation -> IO ()
+writeOutputBuffer :: AIndex -> IORef (Buffer e) -> M.Map AIndex HostAllocation -> IO ()
 writeOutputBuffer idx ref m = let buf = getValue idx m in writeIORef ref buf
 
-getValue :: SomeAllocationIndex -> M.Map SomeAllocationIndex HostAllocation -> Buffer e
+getValue :: AIndex -> M.Map AIndex HostAllocation -> Buffer e
 getValue idx m = case m M.! idx of BufferAllocation (Buffer p) -> Buffer (castForeignPtr p)
                                    ScalarAllocation (Buffer p) -> Buffer (castForeignPtr p)
 
 
 
-propagateAllocSizes :: Allocations -> M.Map SomeAllocationIndex Int -> M.Map SomeAllocationIndex Int
+propagateAllocSizes :: Allocations -> M.Map AIndex Int -> M.Map AIndex Int
 propagateAllocSizes deps sizes | all (`M.member` sizes) (M.keys deps) = sizes
                                | otherwise = let
                                   remainingKeys = filter (\k -> not (M.member k sizes)) (M.keys deps)
