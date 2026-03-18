@@ -34,19 +34,26 @@ void CUDA_CB node_write_output(void *arguments){
     printf("\nSuccesfully put the mvar");
 }
 
+
 void run_graph
     ( uint32_t node_count
     , uint32_t *node_dependency_counts
     , uint32_t **node_dependencies
     , struct NodeContent *node_contents
     , uint32_t allocation_count
-    , uint32_t *allocation_sizes
+    , uint32_t *input_bytesizes
     , char **input_data
     , char **output_data
     , void **output_mvars
     , void *done_mvar )
 {
     printf("Hello from c! The nodecount is %d\n", node_count);
+    printf("\nSize of a pointer %lu\n", sizeof(char*));
+    printf("\nSome nodecontent info: size %lu, alignment: %lu\n", sizeof(struct NodeContent), _Alignof(struct NodeContent));
+    printf("\nSome content content info: size %lu, alignment: %lu\n", sizeof(node_contents[0].content), _Alignof(sizeof(node_contents[0].content)));
+    printf("\nSome kernel content info: size %lu, alignment: %lu\n", sizeof(node_contents[0].content.kernel), _Alignof(sizeof(node_contents[0].content.kernel)));
+
+
     printf("\n\nStarting sort: ");
     // Topological sort (naive implementation)
     bool all_sorted = false;
@@ -124,7 +131,7 @@ void run_graph
     for (size_t i = 0; i < allocation_count; i++)
     {
         CUdeviceptr ptr;
-        CU_CHECK(cuMemAlloc(&ptr, allocation_sizes[i]));
+        CU_CHECK(cuMemAlloc(&ptr, input_bytesizes[i]));
         dev_pointers[i] = ptr;
     }
     printf("\nDone allocating device pointers");
@@ -140,7 +147,6 @@ void run_graph
     }
 
     struct NodeWriteOutputParams *outputParams = malloc(output_node_count * sizeof(struct NodeWriteOutputParams));
-    
 
     size_t output_node_index = 0;
     CUgraphNode *nodes = malloc(node_count * sizeof(CUgraphNode));
@@ -163,64 +169,63 @@ void run_graph
 
         switch (content.node_type)
         {
-        case 0:
+        case NODE_COPY:
             CUDA_MEMCPY3D cpy_params_cpy;
             memset(&cpy_params_cpy, 0, sizeof(cpy_params_cpy));
-            printf("Copy from %d to %d", content.alloc_1, content.alloc_2);
+            printf("Copy from %d to %d", content.content.general.alloc_1, content.content.general.alloc_2);
             cpy_params_cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy_params_cpy.srcDevice = dev_pointers[content.alloc_1];
-            cpy_params_cpy.srcPitch = (size_t)allocation_sizes[content.alloc_1];
+            cpy_params_cpy.srcDevice = dev_pointers[content.content.general.alloc_1];
+            cpy_params_cpy.srcPitch = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_cpy.srcHeight = 1;
             cpy_params_cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy_params_cpy.dstDevice = dev_pointers[content.alloc_2];
-            cpy_params_cpy.dstPitch = (size_t)allocation_sizes[content.alloc_2];
+            cpy_params_cpy.dstDevice = dev_pointers[content.content.general.alloc_2];
+            cpy_params_cpy.dstPitch = (size_t)input_bytesizes[content.content.general.alloc_2];
             cpy_params_cpy.dstHeight = 1;
-            cpy_params_cpy.WidthInBytes = (size_t)allocation_sizes[content.alloc_2];
+            cpy_params_cpy.WidthInBytes = (size_t)input_bytesizes[content.content.general.alloc_2];
             cpy_params_cpy.Height = 1;
             cpy_params_cpy.Depth = 1;
             CU_CHECK(cuGraphAddMemcpyNode(&new_node, graph, dependencies, dependency_count, &cpy_params_cpy, cuContext));
-            // CU_CHECK(cuGraphAddEmptyNode(&new_node, graph, dependencies, dependency_count));
             break;
         
-        case 1:
+        case NODE_INPUT:
             CUDA_MEMCPY3D cpy_params_input;
             memset(&cpy_params_input, 0, sizeof(cpy_params_input));
-            uint32_t input_size = allocation_sizes[content.alloc_1] / 8;
-            printf("Input to %d", content.alloc_1);
+            uint32_t input_size = input_bytesizes[content.content.general.alloc_1] / 8;
+            printf("Input to %d", content.content.general.alloc_1);
             printf("\nInput value: size = %d, value = ", input_size);
             for (uint32_t c = 0; c < input_size; c++){
-                printf("%lu", ((uint64_t* )input_data[content.alloc_1])[c]);
+                printf("%lu", ((uint64_t* )input_data[content.content.general.alloc_1])[c]);
             }
             cpy_params_input.srcMemoryType = CU_MEMORYTYPE_HOST;
-            cpy_params_input.srcHost = (void *)input_data[content.alloc_1];
-            cpy_params_input.srcPitch = (size_t)allocation_sizes[content.alloc_1];
+            cpy_params_input.srcHost = (void *)input_data[content.content.general.alloc_1];
+            cpy_params_input.srcPitch = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_input.srcHeight = 1;
             cpy_params_input.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy_params_input.dstDevice = dev_pointers[content.alloc_1];
-            cpy_params_input.dstPitch = (size_t)allocation_sizes[content.alloc_1];
+            cpy_params_input.dstDevice = dev_pointers[content.content.general.alloc_1];
+            cpy_params_input.dstPitch = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_input.dstHeight = 1;
-            cpy_params_input.WidthInBytes = (size_t)allocation_sizes[content.alloc_1];
+            cpy_params_input.WidthInBytes = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_input.Height = 1;
             cpy_params_input.Depth = 1;
             CU_CHECK(cuGraphAddMemcpyNode(&new_node, graph, dependencies, dependency_count, &cpy_params_input, cuContext));
             break;
-        case 2:
+        case NODE_OUTPUT:
             CUgraphNode copy_node;
             void *output_adress;
-            CU_CHECK(cuMemAllocHost(&output_adress, allocation_sizes[content.alloc_1]));
+            CU_CHECK(cuMemAllocHost(&output_adress, input_bytesizes[content.content.general.alloc_1]));
             CUDA_MEMCPY3D cpy_params_output;
             memset(&cpy_params_output, 0, sizeof(cpy_params_output));
-            printf("Output from %d, size is %d", content.alloc_1, allocation_sizes[content.alloc_1]);
+            printf("Output from %d, size is %d", content.content.general.alloc_1, input_bytesizes[content.content.general.alloc_1]);
             cpy_params_output.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy_params_output.srcDevice = dev_pointers[content.alloc_1];
-            cpy_params_output.srcPitch = (size_t)allocation_sizes[content.alloc_1];
+            cpy_params_output.srcDevice = dev_pointers[content.content.general.alloc_1];
+            cpy_params_output.srcPitch = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_output.srcHeight = 1;
             cpy_params_output.dstMemoryType = CU_MEMORYTYPE_HOST;
             cpy_params_output.dstHost = output_adress;
-            // cpy_params_output.dstHost = (void *)output_data[content.alloc_1];
-            cpy_params_output.dstPitch = (size_t)allocation_sizes[content.alloc_1];
+            // cpy_params_output.dstHost = (void *)output_data[content.content.general.alloc_1];
+            cpy_params_output.dstPitch = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_output.dstHeight = 1;
-            cpy_params_output.WidthInBytes = (size_t)allocation_sizes[content.alloc_1];
+            cpy_params_output.WidthInBytes = (size_t)input_bytesizes[content.content.general.alloc_1];
             cpy_params_output.Height = 1;
             cpy_params_output.Depth = 1;
             CU_CHECK(cuGraphAddMemcpyNode(&copy_node, graph, dependencies, dependency_count, &cpy_params_output, cuContext));
@@ -229,9 +234,9 @@ void run_graph
             memset(&hostParams, 0, sizeof(hostParams));
 
             memset(&outputParams[output_node_index], 0, sizeof(struct NodeWriteOutputParams));
-            outputParams[output_node_index].bytesize = (size_t)allocation_sizes[content.alloc_1];
-            outputParams[output_node_index].done_mvar = output_mvars[content.alloc_1];
-            outputParams[output_node_index].write_adress = (void *)output_data[content.alloc_1];
+            outputParams[output_node_index].bytesize = (size_t)input_bytesizes[content.content.general.alloc_1];
+            outputParams[output_node_index].done_mvar = output_mvars[content.content.general.alloc_1];
+            outputParams[output_node_index].write_adress = (void *)output_data[content.content.general.alloc_1];
             outputParams[output_node_index].read_adress = output_adress;
 
             hostParams.userData = (void *)(&outputParams[output_node_index]);
@@ -240,9 +245,88 @@ void run_graph
             CU_CHECK(cuGraphAddHostNode(&new_node, graph, &copy_node, 1, &hostParams));
             output_node_index += 1;
             break;
-        case 3:
+        case NODE_EMPTY:
             printf("Empty");
             CU_CHECK(cuGraphAddEmptyNode(&new_node, graph, dependencies, dependency_count));
+            break;
+        case NODE_ALLOC: // TODO: Remove placeholder
+            printf("Alloc");
+            CU_CHECK(cuGraphAddEmptyNode(&new_node, graph, dependencies, dependency_count));
+            break;
+        case NODE_KERNEL: // TODO: Remove placeholder
+            printf("Kernel from %d to %d", content.content.kernel.alloc_1, content.content.kernel.alloc_2);
+            printf("\nKernel module: %s", content.content.kernel.module_path);
+            printf("\nKernel symbol: %s", content.content.kernel.symbol);
+            // CUDA_MEMCPY3D placeholder_params;
+            // memset(&placeholder_params, 0, sizeof(placeholder_params));
+            // placeholder_params.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            // placeholder_params.srcDevice = dev_pointers[content.content.kernel.alloc_1];
+            // placeholder_params.srcPitch = (size_t)input_bytesizes[content.content.kernel.alloc_1];
+            // placeholder_params.srcHeight = 1;
+            // placeholder_params.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            // placeholder_params.dstDevice = dev_pointers[content.content.kernel.alloc_2];
+            // placeholder_params.dstPitch = (size_t)input_bytesizes[content.content.kernel.alloc_2];
+            // placeholder_params.dstHeight = 1;
+            // placeholder_params.WidthInBytes = (size_t)input_bytesizes[content.content.kernel.alloc_2];
+            // placeholder_params.Height = 1;
+            // placeholder_params.Depth = 1;
+            // CU_CHECK(cuGraphAddMemcpyNode(&new_node, graph, dependencies, dependency_count, &placeholder_params, cuContext));
+            
+            CUmodule mod;
+            printf("\nLoading module");
+            CU_CHECK(cuModuleLoad(&mod, content.content.kernel.module_path));
+            // unsigned int fcount;
+            // printf("\nCounting functions: ");
+            // CU_CHECK(cuModuleGetFunctionCount(&fcount, mod));
+            // printf("%u", fcount);
+            // CUfunction *fs = (CUfunction *)malloc(sizeof(CUfunction) * fcount);
+            // CU_CHECK(cuModuleEnumerateFunctions(fs, fcount, mod));
+            // printf("\nLooking up symbol");
+            // printf("\nLoading function");
+            // CU_CHECK(cuFuncLoad(fs[0]));
+            // printf("\nDone loading function");
+            // CUfunctionLoadingState lstate;
+            // CU_CHECK(cuFuncIsLoaded(&lstate, fs[0]));
+            // if (lstate == CU_FUNCTION_LOADING_STATE_LOADED){
+            //     printf("\nFunction is indeed loaded");
+            // }
+
+            // char* f_name;
+            // CU_CHECK(cuFuncGetName(&f_name, fs[0]));
+            // printf("\nFunction param count: %s", f_name);
+
+            // CUfunction kernel_func = fs[0];
+
+            printf("\nGetting Function");
+            CUfunction kernel_func;
+            CU_CHECK(cuModuleGetFunction(&kernel_func, mod, content.content.kernel.symbol));
+            printf("\nSetting up parameters");
+            size_t poffset;
+            size_t psize;
+            CU_CHECK(cuFuncGetParamInfo(kernel_func, 0, &poffset, &psize));
+            CU_CHECK(cuFuncGetParamInfo(kernel_func, 1, &poffset, &psize));
+            CU_CHECK(cuFuncGetParamInfo(kernel_func, 2, &poffset, &psize));
+            // CU_CHECK(cuFuncGetParamInfo(kernel_func, 3, &poffset, &psize));
+            printf("\nDone getting param info");
+            
+            CUDA_KERNEL_NODE_PARAMS kernel_params;
+            memset(&kernel_params, 0, sizeof(kernel_params));
+            kernel_params.blockDimX = kernel_params.blockDimY = kernel_params.blockDimZ = 1;
+            kernel_params.gridDimX = kernel_params.gridDimY = kernel_params.gridDimZ = 1;
+            kernel_params.ctx = cuContext;
+            
+            CUdeviceptr npointer; 
+            // CU_CHECK(cuMemAlloc(&npointer, 8));
+            CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
+            CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
+
+            void *args[] = {&npointer, &input_ptr, &output_ptr};
+            // void *args[2] = {(void *)&v2, (void *)&v1};
+            kernel_params.kernelParams = args;
+            kernel_params.func = kernel_func;
+            // kernel_params.func = fs[0];
+
+            CU_CHECK(cuGraphAddKernelNode(&new_node, graph, dependencies, dependency_count, &kernel_params));
             break;
         default:
             break;
@@ -288,7 +372,8 @@ void run_graph
 
     printf("\n\nLaunching graph.");
     CU_CHECK(cuGraphLaunch(executable_graph, 0));
-    
+
+    printf("\n\nSynchronizing.\n");
     CU_CHECK(cuStreamSynchronize(0));
     printf("\n\nGraph Done.\n");
 

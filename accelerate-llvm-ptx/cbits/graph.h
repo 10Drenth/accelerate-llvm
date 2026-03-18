@@ -6,14 +6,24 @@
 
 struct NodeContent;
 struct GraphProgram;
-typedef enum {NODE_COPY, NODE_INPUT, NODE_OUTPUT, NODE_EMPTY} NodeType;
+typedef enum {NODE_COPY, NODE_INPUT, NODE_OUTPUT, NODE_EMPTY, NODE_ALLOC, NODE_KERNEL} NodeType;
+
 
 struct NodeContent {
-    uint32_t node_type;
-    uint32_t alloc_1;
-    uint32_t alloc_2;
-    uint32_t padding;
-};
+    int8_t node_type; // Size 1, alignment 1
+    union {
+        struct {
+            uint32_t alloc_1; // Size 4, alignment 4
+            uint32_t alloc_2; // Size 4, alignment 4
+            char* module_path; // Size 8, alignment 8
+            char* symbol; // Size 8, alignment 8
+        } kernel; // Size 24, alignment 8
+        struct {
+            uint32_t alloc_1;
+            uint32_t alloc_2;
+        } general; // Size 8, alignment 8
+    } content; // Size 24, alignment 8
+}; // Size 32, alignment 8
 
 struct GraphProgram {
     // Graph definition
@@ -45,7 +55,7 @@ void run_graph
     , uint32_t **node_dependencies
     , struct NodeContent *node_contents
     , uint32_t allocation_count
-    , uint32_t *allocation_sizes
+    , uint32_t *input_bytesizes
     , char **input_data
     , char **output_data
     , void **output_mvars
