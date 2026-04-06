@@ -136,6 +136,14 @@ void run_graph
     }
     printf("\nDone allocating device pointers");
 
+    CUmodule mod_alloc;
+    printf("\nLoading module");
+    CU_CHECK(cuModuleLoad(&mod_alloc, "/home/mdrenth/remote/cuda_id/alloc_kernel.ptx"));
+    printf("\n Succesfully loaded alloc module");
+    printf("\nGetting Function");
+    CUfunction alloc_kernel_func;
+    CU_CHECK(cuModuleGetFunction(&alloc_kernel_func, mod_alloc, "id_kern"));
+    printf("\nSetting up parameters");
 
     size_t output_node_count = 0;
     for (size_t i = 0; i < node_count; i++){

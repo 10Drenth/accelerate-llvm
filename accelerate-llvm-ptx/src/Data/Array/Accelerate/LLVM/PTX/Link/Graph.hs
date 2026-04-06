@@ -5,6 +5,8 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TypeApplications #-}
 module Data.Array.Accelerate.LLVM.PTX.Link.Graph (linkProgram, runGraphProgram, GraphProgram) where
 
 import Data.Array.Accelerate.AST.Schedule.Uniform
@@ -26,11 +28,12 @@ import Data.Bifunctor
 import GHC.Conc (PrimMVar, newStablePtrPrimMVar)
 import Control.Concurrent.MVar (newEmptyMVar, MVar)
 import Data.Array.Accelerate.AST.Kernel (kernelFunKernel)
-import Data.ByteString.Short (ShortByteString, fromShort)
+import Data.ByteString.Short (ShortByteString, fromShort, useAsCString)
 import Data.Array.Accelerate.Lifetime (unsafeGetValue)
 import Data.Array.Accelerate.LLVM.PTX.Compile (ObjectR(objPath), objSym)
 import Debug.Trace (trace)
 import Foreign.C (newCString)
+import Data.Type.Equality (type (:~:)(Refl))
 
 
 data GraphProgram = GraphProgram Nodes MemoryMap
@@ -56,18 +59,37 @@ data EventContents = EventContents [NIndex] -- Incoming
 
 type Events = M.Map EventIndex EventContents
 
-data LHSNode t where
-  LHSNodeStart :: EventIndex -> NIndex -> LHSNode Signal
-  LHSNodeEnd :: EventIndex -> NIndex -> LHSNode SignalResolver
-  LHSNodeType :: AIndex -> ScalarType e -> LHSNode t
-  LHSNodeSignal :: EventIndex -> LHSNode Signal
-  LHSNodeResolver :: EventIndex -> LHSNode SignalResolver
-instance Show (LHSNode t) where
-  show (LHSNodeStart e idx) = "StartNode: " ++ show idx
-  show (LHSNodeEnd e idx) = "EndNode: " ++ show idx
-  show (LHSNodeType idx _) = "TypeNode" ++ show idx
-  show (LHSNodeSignal idx) = "SignalNode: " ++ show idx
-  show (LHSNodeResolver idx) = "ResolverNode" ++ show idx
+data GraphEnv t where
+  ScalarVal :: AIndex -> !(ScalarType t) -> GraphEnv t
+  BufferVal :: AIndex -> GraphEnv (Buffer t)
+  RefVal :: GraphEnv t -> GraphEnv (Ref t)
+  OutRefVal :: GraphEnv t -> GraphEnv (OutputRef t)
+  EventDependency :: EventIndex -> GraphEnv Signal
+  EventResolver :: EventIndex -> GraphEnv SignalResolver
+-- instance Show (GraphEnv t) where
+--   show (InputEvent eIdx nIdx) = "Input event " ++ show eIdx ++ ": " ++ show nIdx
+--   show (OutputEvent eIdx nIdx) = "Ouptut event " ++ show eIdx ++ ": " ++ show nIdx
+--   show (ScalarVal idx _) = "ScalarVal: " ++ show idx
+--   show (BufferVal idx _) = "BufferVal: " ++ show idx
+--   show (EventDependency idx) = "EventDependecy: " ++ show idx
+--   show (EventResolver idx) = "EventResolver: " ++ show idx
+envMemIdx :: GraphEnv t -> Maybe AIndex
+envMemIdx (ScalarVal idx _) = Just idx
+envMemIdx (BufferVal idx) = Just idx
+envMemIdx (RefVal v) = envMemIdx v
+envMemIdx (OutRefVal v) = envMemIdx v
+envMemIdx _ = Nothing
+
+instance Distributes GraphEnv where
+  reprIsSingle (ScalarVal _ tp) = reprIsSingle tp
+  reprIsSingle (BufferVal _) = Refl
+  reprIsSingle (EventDependency _) = Refl
+  reprIsSingle (EventResolver _) = Refl
+  reprIsSingle (RefVal _) = Refl
+  reprIsSingle (OutRefVal _) = Refl
+
+  pairImpossible (ScalarVal _ tp) = pairImpossible tp
+  unitImpossible (ScalarVal _ tp) = unitImpossible tp
 
 data KernelNodeContents = KernelNodeContents
   { readAdresses :: [AIndex]
@@ -117,18 +139,15 @@ instance Storable KernelNodeContents where
   alignment = const 8
   sizeOf = const 24
   peek = error "Not implemented"
-  poke ptr contents = do
+  poke ptr contents = useAsCString (kernelName contents) $ \symbolC -> do
         pokeByteOff ptr 0 r
         pokeByteOff ptr 4 w
         p <- newCString $ modulePath contents
-        f <- newCString $ tail $ init $ show $ kernelName contents -- This is bad
         pokeByteOff ptr 8 p
-        pokeByteOff ptr 16 f
+        pokeByteOff ptr 16 symbolC
         where
           r = aIdxToCRep $ head $ readAdresses contents 
           w = aIdxToCRep $ head $ writeAdresses contents 
-
-
 
 cnodeType :: NContent -> Int8
 cnodeType (CopyNode {}) = 0
@@ -164,12 +183,12 @@ convertFun :: forall t. UniformScheduleFun PTXKernel () t -> GraphProgram
 convertFun (Sbody _) = error ""
 convertFun (Slam lhs1 (Slam lhs2 f)) = convertFun (Slam (LeftHandSidePair lhs1 lhs2) f)
 convertFun (Slam lhs (Sbody body)) = let
-  (lhsNodes, m, a, e) = convertLHS undefined (lhsToTupR lhs) M.empty M.empty M.empty
+  (lhsNodes, s) = convertLHS (lhsToTupR lhs) (ConvState M.empty M.empty M.empty)
   lhsenv = push' Empty (lhs, lhsNodes)
-  (m', a', e') = convertBody lhsenv body Nothing m a e
+  s' = convertBody s lhsenv body Nothing
   
-  m'' = processSignalDependencies m' e'
-  in trace ("events:" ++ prettyPrintMap e') $ GraphProgram m'' a'
+  nodes'' = processSignalDependencies (nodes s') (events s')
+  in trace ("events:" ++ prettyPrintMap (events s')) $ GraphProgram nodes'' (memDeps s')
 
 processSignalDependencies :: Nodes -> Events -> Nodes
 processSignalDependencies ns es = foldr f ns (M.elems es)
@@ -179,167 +198,143 @@ processSignalDependencies ns es = foldr f ns (M.elems es)
                 then addDeps n incoming
                 else n
 
-convertBody :: Env LHSNode env -> UniformSchedule PTXKernel env -> Maybe NIndex -> Nodes -> MemoryMap -> Events -> (Nodes, MemoryMap, Events)
-convertBody _ Return _ m a e = (m, a, e)
-convertBody env (Spawn l r) prev m a e = let
-  (m', a', e') = convertBody env l prev m a e
-  in convertBody env r prev m' a' e'
-convertBody env (Effect (SignalAwait signals) Return) prev m a e = let
-  idx = NodeIndex $ M.size m
-  m' = M.insert idx (EmptyNode (maybeToList prev)) m
-  e' = updateEvents env idx signals e
-  in (m', a, e')
-convertBody env (Effect (SignalAwait signals) next) prev m a e = let
-  idx = NodeIndex $ M.size m
-  e' = updateEvents env idx signals e
-  in convertBody env next prev m a e'
-convertBody env (Effect (SignalResolve signals) next) prev m a e = let
-  e' = case prev of
-    (Just n) -> updateEvents env n signals e
-    Nothing  -> e
-  in convertBody env next prev m a e'
-convertBody env (Alet lhs (NewSignal _) next) prev m a e = let
-  eventIdx = EventIndex $ M.size e
-  e' = M.insert eventIdx (EventContents [] []) e
-  env' =  push' env (lhs, (LHSNodeSignal eventIdx, LHSNodeResolver eventIdx))
-  in convertBody env' next prev m a e'
-convertBody env (Alet lhs (RefRead rref) (Effect (RefWrite wref _) next)) prev m a e = let
-  idxIn :: AIndex
-  idxIn = case prj' (varIdx rref) env of (LHSNodeType idx _) -> idx
-  env' = push' env (lhs, undefined) -- It will only be read here
+data ConvState = ConvState 
+  { nodes :: Nodes
+  , memDeps :: MemoryMap
+  , events :: Events
+  }
 
-  idxOut :: AIndex
-  idxOut = case prj' (varIdx wref) env' of (LHSNodeType idx _) -> idx
+-- convertBody :: Env LHSNode env -> UniformSchedule PTXKernel env -> Maybe NIndex -> Nodes -> MemoryMap -> Events -> (Nodes, MemoryMap, Events)
+convertBody :: ConvState -> Env GraphEnv env -> UniformSchedule PTXKernel env -> Maybe NIndex -> ConvState
+convertBody s@(ConvState {..}) env schedule prev = let
+  nodeIdx = NodeIndex $ M.size nodes
+  eventIdx = EventIndex $ M.size events
+  memIdx = AIndex $ M.size memDeps
+  in case schedule of
 
-  a' = M.adjust (idxIn :) idxOut a
-  nIdx :: NIndex
-  nIdx = NodeIndex $ M.size m
-  m' = M.insert nIdx (CopyNode (maybeToList prev) idxIn idxOut) m
+  Return -> s
 
-  in convertBody env' next (Just nIdx) m' a' e
+  (Spawn l r) -> let 
+    s' = convertBody s env l prev
+    in convertBody s' env r prev
 
+  (Effect (SignalAwait signals) Return) -> let
+    nodes' = M.insert nodeIdx (EmptyNode (maybeToList prev)) nodes
+    events' = updateEvents env nodeIdx signals events
+    in s {nodes = nodes', events = events'}
+
+  (Effect (SignalAwait signals) next) -> let
+    idx = NodeIndex $ M.size nodes
+    events' = updateEvents env idx signals events
+    in convertBody s {events = events'} env next prev 
+
+  (Effect (SignalResolve signals) next) -> let
+    events' = case prev of
+      (Just n) -> updateEvents env n signals events
+      Nothing  -> events
+    in convertBody s {events = events'} env next prev
+
+  (Alet lhs (NewSignal _) next) -> let
+    events' = M.insert eventIdx (EventContents [] []) events
+    env' =  push' env (lhs, (EventDependency eventIdx, EventResolver eventIdx))
+    in convertBody s {events = events'} env' next prev
+  
+  (Alet lhs (RefRead rref) (Effect (RefWrite wref _) next)) -> 
+    case prj' (varIdx rref) env of 
+      (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
+        Refl -> let
+
+          idxIn = case envMemIdx rval of 
+            (Just v) -> v
+            _ -> error "RefRead invalid value"
+
+          env' = push' env (lhs, rval)
+
+          idxOut = case envMemIdx $ prj' (varIdx wref) env' of
+            (Just v) -> v
+            _ -> error "RefWrite invalid value"
+
+          memDeps' = M.adjust (idxIn :) idxOut memDeps
+          nodes' = M.insert nodeIdx (CopyNode (maybeToList prev) idxIn idxOut) nodes
+
+          in convertBody s {nodes = nodes', memDeps = memDeps'} env' next (Just nodeIdx)
+      _ -> error "RefRead invalid value"
 
 -- BEGIN TODO
-convertBody env (Alet lhs (Alloc sh tp vs) next) prev m a e = let
-  env' = push' env (lhs, undefined) -- TEMP SOLUTION
-  in convertBody env' next prev m a e
-convertBody env (Alet lhs (RefRead rref) next) prev m a e = let
-  env' = push' env (lhs, undefined) -- TEMP SOLUTION
-  in convertBody env' next prev m a e
-convertBody env (Effect (RefWrite _ _) next) prev m a e = let
-  in convertBody env next prev m a e
-convertBody env (Effect (Exec metaData fun args) next) prev m a e = case kernelFunKernel fun of
-  (Exists kernel) -> let
-    obj = kernelObject kernel
-    idx = NodeIndex $ M.size m
-    -- TODO: Get proper in and out adresses
-    content = KernelNodeContents [AIndex 0] [AIndex 1] (objPath obj) (objSym obj)
-    m' = M.insert idx (KernelNode (maybeToList prev) content) m
-    a' = M.adjust (AIndex 0 :) (AIndex 1) a
-    in convertBody env next (Just idx) m' a' e
+  (Alet lhs (Alloc sh tp vs) next) -> let
+    memDeps' = memDeps --M.insert memIdx [] memDeps
+    env' = push' env (lhs, BufferVal memIdx)
+    in convertBody s {memDeps = memDeps'} env' next prev
+  (Alet lhs (RefRead rref) next) ->
+    case prj' (varIdx rref) env of 
+      (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
+        Refl -> let
+          env' = push' env (lhs, rval)
+          in convertBody s env' next prev
+      _ -> error "RefRead invalid value"
+  (Effect (RefWrite _ _) next) -> let
+    in convertBody s env next prev
+  (Effect (Exec metaData fun args) next) -> case kernelFunKernel fun of
+    (Exists kernel) -> let
+      obj = kernelObject kernel
+      -- TODO: Get proper in and out adresses
+      -- 
+      content = KernelNodeContents [AIndex 0] [AIndex 1] (objPath obj) (objSym obj)
+      nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
+      -- Dependency sets link from first input to first output
+      memDeps' = M.adjust (AIndex 0 :) (AIndex 1) memDeps
+      in convertBody s {nodes = nodes', memDeps = memDeps'} env next (Just nodeIdx)
 -- END TODO
 
-convertBody _ _ _ _ _ _ = internalError "Unexpected body contents in schedule. Currently on handles Identity functions"
+  _ -> error "Unexpected body contents in schedule."
 
--- tryConvertKernel :: Env LHSNode env -> UniformSchedule PTXKernel env -> Maybe KernelNodeContents -> Maybe (KernelNodeContents, UniformSchedule PTXKernel env)
--- tryConvertKernel env s@Return n = (, s) <$> n
--- tryConvertKernel env s@(Spawn {}) n = (, s) <$> n
--- tryConvertKernel env s@(Effect (SignalAwait _) _) n = (, s) <$> n
--- tryConvertKernel env s@(Effect (SignalResolve _) _) n = (, s) <$> n
--- tryConvertKernel env (Effect (Exec metaData fun args) _) n = undefined
--- -- A write should only occur after a kernel is run. So match on Just n
--- tryConvertKernel env (Effect (RefWrite out _) next) (Just n) = let
---   idxOut :: AIndex
---   idxOut = case prj' (varIdx out) env of (LHSNodeType idx _) -> idx
---   n' = KernelNodeContents (readAdresses n) (idxOut : writeAdresses n)
-
---   in tryConvertKernel env next (Just n')
--- tryConvertKernel env (Alet lhs (RefRead ref) next) n = let
---   idxIn :: AIndex
---   idxIn = case prj' (varIdx ref) env of (LHSNodeType idx _) -> idx
---   env' = push' env (lhs, undefined) -- It will only be read here
---   in if hasKernel next then tryConvertKernel env' next n
---   else Nothing
---   -- in do 
---   --   (n', next') <- tryConvertKernel env' next n
---   --   let n'' = KernelNodeContents (idxIn : readAdresses n') (writeAdresses n')
---   --   return (n'', next')
--- tryConvertKernel env (Alet lhs (Alloc {}) next) n = let
---   env' = push' env (lhs, undefined) -- It will only be read here
---   in tryConvertKernel env' next n
--- tryConvertKernel _ _ _ = internalError "unsupported"
-
-
-
--- hasKernel :: UniformSchedule PTXKernel env -> Bool
--- hasKernel Return = False
--- hasKernel (Spawn _ _ ) = False
--- hasKernel (Effect (SignalAwait _) _) = False
--- hasKernel (Effect (SignalResolve _) _) = False
--- hasKernel (Effect (Exec {} ) _) = True
--- hasKernel (Effect _ next) = hasKernel next
--- hasKernel (Alet _ _ next) = hasKernel next
--- hasKernel _ = False
-
-updateEvents :: Env LHSNode env -> NIndex -> [Idx env t] -> Events -> Events
+updateEvents :: Env GraphEnv env -> NIndex -> [Idx env t] -> Events -> Events
 updateEvents env n ss e = foldr (f . (`prj'` env)) e ss
   where
-    f :: LHSNode t -> Events -> Events
-    f (LHSNodeSignal eidx) m = M.adjust (\(EventContents incoming outgoing) -> EventContents incoming (n : outgoing)) eidx m
-    f (LHSNodeResolver eidx) m = M.adjust (\(EventContents incoming outgoing) -> EventContents (n: incoming) outgoing) eidx m
-    f (LHSNodeStart eidx _) m = M.adjust (\(EventContents incoming outgoing) -> EventContents incoming (n: outgoing)) eidx m
-    f (LHSNodeEnd eidx _) m = M.adjust (\(EventContents incoming outgoing) -> EventContents (n: incoming) outgoing) eidx m
+    f :: GraphEnv t -> Events -> Events
+    f (EventDependency eidx) m = M.adjust (\(EventContents incoming outgoing) -> EventContents incoming (n : outgoing)) eidx m
+    f (EventResolver eidx) m = M.adjust (\(EventContents incoming outgoing) -> EventContents (n: incoming) outgoing) eidx m
     f _ m = m
 
-convertLHS :: t -> BasesR t -> Nodes -> MemoryMap -> Events -> (Distribute LHSNode t, Nodes, MemoryMap, Events)
+convertLHS :: BasesR t -> ConvState -> (Distribute GraphEnv t, ConvState)
+convertLHS tup s@(ConvState {..}) = let
+  nodeIdx = NodeIndex $ M.size nodes
+  eventIdx = EventIndex $ M.size events
+  memIdx = AIndex $ M.size memDeps
+  in case tup of
 -- Unit
-convertLHS _ TupRunit m a e = ((), m, a, e)
--- Scalar input argument
-convertLHS _ (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRscalar tp))) m a e =
-  let alloc = AIndex $ M.size a in
-  ( ( LHSNodeStart (EventIndex $ M.size e) (NodeIndex (M.size m))
-    , LHSNodeType (AIndex (M.size a)) tp
+  TupRunit -> ((), s)
+-- input argument
+  (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref scalarOrBuffer)) ->
+    ( ( EventDependency eventIdx
+      , RefVal $ case scalarOrBuffer of 
+        (GroundRscalar tp) -> ScalarVal memIdx tp
+        (GroundRbuffer _) ->  BufferVal memIdx
+      )
+    , s 
+      { nodes = M.insert nodeIdx (Input memIdx) nodes
+      , memDeps = M.insert memIdx [] memDeps
+      , events = M.insert eventIdx (EventContents [nodeIdx] []) events
+      } 
     )
-  , M.insert (NodeIndex $ M.size m) (Input alloc) m
-  , M.insert alloc [] a
-  , M.insert (EventIndex $ M.size e) (EventContents [NodeIndex $ M.size m] []) e
-  )
--- Buffer input argument
-convertLHS _ (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (GroundRbuffer tp))) m a e =
-  let alloc = AIndex $ M.size a in
-  ( ( LHSNodeStart (EventIndex $ M.size e) (NodeIndex (M.size m))
-    , LHSNodeType (AIndex (M.size a)) tp
+-- output argument
+  (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite scalarOrBuffer)) ->
+    ( ( EventResolver eventIdx
+      , OutRefVal $ case scalarOrBuffer of 
+        (GroundRscalar tp) -> ScalarVal memIdx tp
+        (GroundRbuffer _) -> BufferVal memIdx
+      )
+    , s 
+      { nodes = M.insert nodeIdx (Output memIdx []) nodes
+      , memDeps = M.insert memIdx [] memDeps
+      , events = M.insert eventIdx (EventContents [] [nodeIdx]) events
+      } 
     )
-  , M.insert (NodeIndex $ M.size m) (Input alloc) m
-  , M.insert alloc [] a
-  , M.insert (EventIndex $ M.size e) (EventContents [NodeIndex $ M.size m] []) e
-  )
--- Scalar output argument
-convertLHS _ (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRscalar tp))) m a e =
-  let alloc = AIndex $ M.size a in
-  ( ( LHSNodeEnd (EventIndex $ M.size e) (NodeIndex (M.size m))
-    , LHSNodeType (AIndex (M.size a)) tp
-    )
-  , M.insert (NodeIndex $ M.size m) (Output alloc []) m
-  , M.insert alloc [] a
-  , M.insert (EventIndex $ M.size e) (EventContents [] [NodeIndex $ M.size m]) e
-  )
--- Buffer output argument
-convertLHS  _ (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite (GroundRbuffer tp))) m a e =
-  let alloc = AIndex $ M.size a in
-  ( ( LHSNodeEnd (EventIndex $ M.size e) (NodeIndex (M.size m))
-    , LHSNodeType (AIndex (M.size a)) tp
-    )
-  , M.insert (NodeIndex $ M.size m) (Output alloc []) m
-  , M.insert alloc [] a
-  , M.insert (EventIndex $ M.size e) (EventContents [] [NodeIndex $ M.size m]) e
-  )
--- Pair
-convertLHS _ (TupRpair t1 t2) m a e = let
-  (res1, m', a', e') = convertLHS undefined t1 m a e
-  (res2, m'', a'', e'') = convertLHS undefined t2 m' a' e'
-  in ((res1, res2), m'', a'', e'')
-convertLHS _ _ _ _ _ = internalError "Unexpected types in the input or output of an Acc function"
+  (TupRpair l r) -> let 
+    (vl, s') = convertLHS l s
+    (vr, s'') = convertLHS r s' 
+    in ((vl, vr), s'')
+  _ -> error "Unexpected types in the input or output of an Acc function"
 
 instance Show GraphProgram where
   show (GraphProgram ns as) = "\n\n===Node Graph==\n"
@@ -487,36 +482,6 @@ getHostAllocFp :: HostAllocation -> ForeignPtr Word8
 getHostAllocFp (ScalarAllocation (Buffer fptr)) = castForeignPtr fptr
 getHostAllocFp (BufferAllocation (Buffer fptr)) = castForeignPtr fptr
 
-
-
-writeNodeContents :: Int -> NContent -> Ptr Word32 -> IO ()
-writeNodeContents idx nodeContent ptr = case nodeContent of
-  (CopyNode _ a1 a2) -> do
-    pokeType 0
-    pokeA1 a1
-    pokeA2 a2
-  (Input a) -> do
-    pokeType 1
-    pokeA1 a
-  (Output a _) -> do
-    pokeType 2
-    pokeA1 a
-  (EmptyNode _) -> do
-    pokeType 3
-  -- (AllocNode a _ _ _) -> do
-  --   pokeType 4
-  --   pokeA1 a
-  (KernelNode _ (KernelNodeContents i o mod sym)) -> do
-    pokeType 5
-    pokeA1 (head i)
-    pokeA2 (head o)
-  where
-    cursor0 = idx * 4
-    cursor1 = cursor0 + 1
-    cursor2 = cursor0 + 2
-    pokeType = pokeElemOff ptr cursor0
-    pokeA1 = pokeElemOff ptr cursor1 . fromIntegral . aIdxToInt
-    pokeA2 = pokeElemOff ptr cursor2 . fromIntegral . aIdxToInt
 
 withDeps :: Storable a => [[a]] -> ([Ptr a] -> IO b) -> IO b
 withDeps xs op = do
