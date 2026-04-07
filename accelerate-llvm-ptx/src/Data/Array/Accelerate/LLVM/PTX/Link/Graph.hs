@@ -10,7 +10,7 @@
 module Data.Array.Accelerate.LLVM.PTX.Link.Graph (linkProgram, runGraphProgram, GraphProgram) where
 
 import Data.Array.Accelerate.AST.Schedule.Uniform
-import Data.Array.Accelerate.LLVM.PTX.Kernel (PTXKernel (kernelLinked, kernelObject))
+import Data.Array.Accelerate.LLVM.PTX.Kernel
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.AST.LeftHandSide
 import Data.Array.Accelerate.AST.Environment
@@ -20,7 +20,7 @@ import qualified Data.Map as M
 import Data.Array.Accelerate.AST.Idx
 import Control.Concurrent (readMVar, putMVar, takeMVar, forkIO)
 import Data.IORef (readIORef, IORef, writeIORef)
-import Data.Array.Accelerate.Representation.Elt (showElt, bytesElt)
+import Data.Array.Accelerate.Representation.Elt (showElt, scalarTypeSize)
 import Data.Array.Accelerate.Array.Buffer (bufferToList, Buffer (Buffer), memoryByteSize, MutableBuffer (..), newBuffer, writeBuffer, indexBuffer)
 import Foreign
 import Data.Maybe (mapMaybe, maybeToList)
@@ -276,7 +276,7 @@ convertBody s@(ConvState {..}) env schedule prev = let
     in convertBody s env next prev
   (Effect (Exec metaData fun args) next) -> case kernelFunKernel fun of
     (Exists kernel) -> let
-      obj = kernelObject kernel
+      obj = kernelPhaseObject $ kernelMain kernel
       -- TODO: Get proper in and out adresses
       -- 
       content = KernelNodeContents [AIndex 0] [AIndex 1] (objPath obj) (objSym obj)
@@ -508,7 +508,7 @@ inspectInputAllocSizes (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (
   readMVar mvar
   val <- readIORef input
 
-  let byteSize = max 1 (bytesElt (TupRsingle tp))
+  let byteSize = max 1 (scalarTypeSize tp)
   mbuffer@(MutableBuffer buffer) <- newBuffer tp 1
   writeBuffer tp mbuffer 0 val
   let vs' = M.insert (currentIndex p) (ScalarAllocation (Buffer buffer)) (inputValues p)
@@ -530,7 +530,7 @@ inspectInputAllocSizes (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref (
 
   putStrLn "Input buffer value:"
   putStrLn $ "type: " ++ show tp ++ ", bytesize: " ++ show byteSize'
-  let l = bufferToList tp (byteSize' `div` bytesElt (TupRsingle tp)) val
+  let l = bufferToList tp (byteSize' `div` scalarTypeSize tp) val
   let s = concatMap (\e -> ' ' : showElt (TupRsingle tp) e) l
   print $ "[" ++ s ++ " ]"
 
