@@ -831,4 +831,4 @@ codeGenKernel name args body =
     declare :: GlobalFunction f
     declare = args $ Body VoidType (Just Tail) (fromString name)
 
-type KernelType env = Ptr (SizedArray Word) -> MarshalFun env
+type KernelType env = Ptr (SizedArray Word) -> Ptr (Struct (MarshalEnv env)) -> ()

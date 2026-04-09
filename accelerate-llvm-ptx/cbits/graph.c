@@ -313,7 +313,7 @@ void run_graph
             size_t psize;
             CU_CHECK(cuFuncGetParamInfo(kernel_func, 0, &poffset, &psize));
             CU_CHECK(cuFuncGetParamInfo(kernel_func, 1, &poffset, &psize));
-            CU_CHECK(cuFuncGetParamInfo(kernel_func, 2, &poffset, &psize));
+            // CU_CHECK(cuFuncGetParamInfo(kernel_func, 2, &poffset, &psize));
             // CU_CHECK(cuFuncGetParamInfo(kernel_func, 3, &poffset, &psize));
             printf("\nDone getting param info");
             
@@ -327,9 +327,26 @@ void run_graph
             // CU_CHECK(cuMemAlloc(&npointer, 8));
             CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
             CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
+            struct ST {
+                CUdeviceptr outp;
+                CUdeviceptr inp;
+            };
+            struct ST st;
+            st.inp = input_ptr;
+            st.outp = output_ptr;
+            CUdeviceptr params_ptr;
+            CUdeviceptr arr[2] = {output_ptr, input_ptr};
+            printf("\nAllocating param struct");
+            CU_CHECK(cuMemAlloc(&params_ptr, sizeof(arr)));
+            // CU_CHECK(cuMemAlloc(&params_ptr, sizeof(struct ST)));
 
-            void *args[] = {&npointer, &input_ptr, &output_ptr};
-            // void *args[2] = {(void *)&v2, (void *)&v1};
+            // cu
+            printf("\nCopying param struct to device");
+            CU_CHECK(cuMemcpyHtoD(params_ptr, (void *)arr, sizeof(arr)));
+            // CU_CHECK(cuMemcpyHtoD(params_ptr, (void *)&st, sizeof(struct ST)));
+
+            void *args[] = {&npointer, &params_ptr};
+            // void *args[] = {&npointer, &input_ptr, &output_ptr};
             kernel_params.kernelParams = args;
             kernel_params.func = kernel_func;
             // kernel_params.func = fs[0];
