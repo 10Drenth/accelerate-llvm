@@ -10,11 +10,13 @@ packages:
 - accelerate-llvm-ptx
 
 extra-deps:
+# - cuda-0.11.0.1
 - cuda-0.12.8.0
 - nvvm-0.10.0.1
 - OptDir-0.0.4
 - bytestring-encoding-0.1.2.0
 - ../accelerate
+- ../cuda
 - MIP-0.2.0.0
 
 - github: tomsmeding/llvm-pretty

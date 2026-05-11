@@ -30,10 +30,15 @@ import Control.Concurrent.MVar (newEmptyMVar, MVar)
 import Data.Array.Accelerate.AST.Kernel (kernelFunKernel)
 import Data.ByteString.Short (ShortByteString, fromShort, useAsCString)
 import Data.Array.Accelerate.Lifetime (unsafeGetValue)
-import Data.Array.Accelerate.LLVM.PTX.Compile (ObjectR(objPath), objSym)
+import Data.Array.Accelerate.LLVM.PTX.Compile (ObjectR(objPath), objSym, compile)
 import Debug.Trace (trace)
 import Foreign.C (newCString)
 import Data.Type.Equality (type (:~:)(Refl))
+import Data.Array.Accelerate.LLVM.State
+import Data.Array.Accelerate.LLVM.PTX.Target
+import LLVM.AST.Type.Representation (SizedArray, Struct)
+import Data.Array.Accelerate.LLVM.CodeGen.Environment (MarshalEnv)
+import Data.Array.Accelerate.LLVM.PTX.CodeGen.Base (codeGenKernel)
 
 
 data GraphProgram = GraphProgram Nodes MemoryMap
@@ -287,6 +292,14 @@ convertBody s@(ConvState {..}) env schedule prev = let
 -- END TODO
 
   _ -> error "Unexpected body contents in schedule."
+
+type PrepKernel env = Ptr (SizedArray Word) -> Ptr (Struct (MarshalEnv env)) -> ()
+
+generatePrepareKernel :: PTXKernel a -> LLVM PTX (ObjectR (PrepKernel a))
+generatePrepareKernel kernel = do
+  _ <- codeGenKernel undefined undefined undefined undefined undefined
+  compile undefined undefined undefined undefined
+
 
 updateEvents :: Env GraphEnv env -> NIndex -> [Idx env t] -> Events -> Events
 updateEvents env n ss e = foldr (f . (`prj'` env)) e ss

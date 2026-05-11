@@ -134,6 +134,9 @@ compile uid name config module' = do
                                 Pretty.style { Pretty.lineLength = maxBound `div` 2 }
                                 (LP.ppLLVM llvmver (LP.ppModule ast))
                               ++ "\n\n" ++ accPreludePTX
+        
+        putStrLn unoptimisedText 
+
         Debug.when Debug.verbose $ do
           Debug.traceM Debug.dump_cc ("Unoptimised LLVM IR:\n" % string) unoptimisedText
 
