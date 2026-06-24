@@ -4,6 +4,7 @@
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE TypeOperators     #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
 
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX.Kernel
@@ -66,6 +67,7 @@ import Data.String
 import LLVM.AST.Type.Downcast
 import LLVM.AST.Type.Representation
 import LLVM.AST.Type.Module
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel (PrepKernel, prepKernelCodeGen, PrepContext)
 
 data PTXKernel env where
   PTXKernel
@@ -94,6 +96,7 @@ data PTXKernel env where
        , kernelMemorySize :: {-# UNPACK #-} !Int
        , kernelDescDetail :: String
        , kernelDescBrief  :: String
+       , kernelPrepGen :: (String, UID)
        }
     -> PTXKernel env
 
@@ -112,7 +115,7 @@ data PTXKernelPhase env where
     -> PTXKernelPhase env
 
 instance NFData' PTXKernel where
-  rnf' (PTXKernel p1 p2 p3 !_ sz !_ !_ s l) =
+  rnf' (PTXKernel p1 p2 p3 !_ sz !_ !_ s l !_) =
     maybe () rnf' p1 `seq` rnf' p2 `seq` maybe () rnf' p3
       `seq` rnf sz `seq` rnf s `seq` rnf l
 
@@ -147,6 +150,8 @@ instance IsKernel PTXKernel where
       (ptxCodeKernelMemory ptxCode)
       detail
       brief
+      ("prep_" ++ fullName, hashIncrement 3 uid)
+
     where
       (name, detail, brief) = generateKernelNameAndDescription operationName cluster
       fullName = name ++ "_" ++ show uid
@@ -171,9 +176,9 @@ instance PrettyKernel PTXKernel where
     where
       go :: OpenKernelFun PTXKernel env t -> Adoc
       go (KernelFunLam _ f) = go f
-      go (KernelFunBody (PTXKernel _ phase _ _ _ _ _ "" _))
+      go (KernelFunBody (PTXKernel _ phase _ _ _ _ _ "" _ _))
         = fromString $ take 32 $ toString $ kernelPhaseId phase
-      go (KernelFunBody (PTXKernel _ phase _ _ _ _ _ detail brief))
+      go (KernelFunBody (PTXKernel _ phase _ _ _ _ _ detail brief _))
         = fromString (take 32 $ toString $ kernelPhaseId phase)
         <+> flatAlt (group $ line' <> "-- " <> desc)
           ("{- " <> desc <> "-}")

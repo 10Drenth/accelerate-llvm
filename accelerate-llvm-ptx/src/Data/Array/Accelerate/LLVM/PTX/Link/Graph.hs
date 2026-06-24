@@ -1,12 +1,16 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies        #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE CPP                      #-}
+{-# LANGUAGE AllowAmbiguousTypes  #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE ImpredicativeTypes   #-}
+
 module Data.Array.Accelerate.LLVM.PTX.Link.Graph (linkProgram, runGraphProgram, GraphProgram) where
 
 import Data.Array.Accelerate.AST.Schedule.Uniform
@@ -14,7 +18,6 @@ import Data.Array.Accelerate.LLVM.PTX.Kernel
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.AST.LeftHandSide
 import Data.Array.Accelerate.AST.Environment
-import Data.Array.Accelerate.Type (ScalarType, CChar (CChar))
 import Data.Array.Accelerate.Error (internalError)
 import qualified Data.Map as M
 import Data.Array.Accelerate.AST.Idx
@@ -28,32 +31,28 @@ import Data.Bifunctor
 import GHC.Conc (PrimMVar, newStablePtrPrimMVar)
 import Control.Concurrent.MVar (newEmptyMVar, MVar)
 import Data.Array.Accelerate.AST.Kernel (kernelFunKernel)
-import Data.ByteString.Short (ShortByteString, fromShort, useAsCString)
-import Data.Array.Accelerate.Lifetime (unsafeGetValue)
-import Data.Array.Accelerate.LLVM.PTX.Compile (ObjectR(objPath), objSym, compile)
+import Data.ByteString.Short (ShortByteString, useAsCString)
 import Debug.Trace (trace)
 import Foreign.C (newCString)
 import Data.Type.Equality (type (:~:)(Refl))
-import Data.Array.Accelerate.LLVM.State
 import Data.Array.Accelerate.LLVM.PTX.Target
-import LLVM.AST.Type.Representation (SizedArray, Struct)
-import Data.Array.Accelerate.LLVM.CodeGen.Environment (MarshalEnv)
-import Data.Array.Accelerate.LLVM.PTX.CodeGen.Base (codeGenKernel)
+import Data.Array.Accelerate.LLVM.CodeGen.Monad (CodeGen)
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment
+import Data.Array.Accelerate.Type
+import Data.Array.Accelerate.LLVM.PTX.Compile
+import GHC.IO (unsafePerformIO)
+import Data.Array.Accelerate.LLVM.PTX.State (evalPTX, defaultTarget)
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel (compilePrep)
+
 
 
 data GraphProgram = GraphProgram Nodes MemoryMap
 
 newtype NIndex = NodeIndex Int
   deriving (Eq, Ord)
-newtype AIndex = AIndex Int
-  deriving (Eq, Ord)
-aIdxToInt :: AIndex -> Int
-aIdxToInt (AIndex v) = v
 aIdxToCRep :: AIndex -> Int32
 aIdxToCRep (AIndex v) = fromIntegral v
 
-newtype EventIndex = EventIndex Int
-  deriving (Eq, Ord, Show)
 
 type Nodes = M.Map NIndex NContent
 type MemoryMap = M.Map AIndex [AIndex]
@@ -64,43 +63,13 @@ data EventContents = EventContents [NIndex] -- Incoming
 
 type Events = M.Map EventIndex EventContents
 
-data GraphEnv t where
-  ScalarVal :: AIndex -> !(ScalarType t) -> GraphEnv t
-  BufferVal :: AIndex -> GraphEnv (Buffer t)
-  RefVal :: GraphEnv t -> GraphEnv (Ref t)
-  OutRefVal :: GraphEnv t -> GraphEnv (OutputRef t)
-  EventDependency :: EventIndex -> GraphEnv Signal
-  EventResolver :: EventIndex -> GraphEnv SignalResolver
--- instance Show (GraphEnv t) where
---   show (InputEvent eIdx nIdx) = "Input event " ++ show eIdx ++ ": " ++ show nIdx
---   show (OutputEvent eIdx nIdx) = "Ouptut event " ++ show eIdx ++ ": " ++ show nIdx
---   show (ScalarVal idx _) = "ScalarVal: " ++ show idx
---   show (BufferVal idx _) = "BufferVal: " ++ show idx
---   show (EventDependency idx) = "EventDependecy: " ++ show idx
---   show (EventResolver idx) = "EventResolver: " ++ show idx
-envMemIdx :: GraphEnv t -> Maybe AIndex
-envMemIdx (ScalarVal idx _) = Just idx
-envMemIdx (BufferVal idx) = Just idx
-envMemIdx (RefVal v) = envMemIdx v
-envMemIdx (OutRefVal v) = envMemIdx v
-envMemIdx _ = Nothing
-
-instance Distributes GraphEnv where
-  reprIsSingle (ScalarVal _ tp) = reprIsSingle tp
-  reprIsSingle (BufferVal _) = Refl
-  reprIsSingle (EventDependency _) = Refl
-  reprIsSingle (EventResolver _) = Refl
-  reprIsSingle (RefVal _) = Refl
-  reprIsSingle (OutRefVal _) = Refl
-
-  pairImpossible (ScalarVal _ tp) = pairImpossible tp
-  unitImpossible (ScalarVal _ tp) = unitImpossible tp
 
 data KernelNodeContents = KernelNodeContents
   { readAdresses :: [AIndex]
   , writeAdresses :: [AIndex]
   , modulePath :: FilePath
   , kernelName :: ShortByteString
+  , prepKernelName :: ShortByteString
   }
   deriving (Show)
 
@@ -120,7 +89,7 @@ data NContent = CopyNode [NIndex] -- Dependencies
 
 instance Storable NContent where
   alignment = const 8
-  sizeOf = const 32
+  sizeOf = const 40
   peek = error "Not implemented"
   poke ptr n = do
     pokeByteOff ptr 0 ntype
@@ -131,28 +100,30 @@ instance Storable NContent where
       (EmptyNode {}) -> pokeGeneral 0 0
       -- (AllocNode {}) -> 4
       (KernelNode _ v) -> pokeByteOff ptr 8 v
-    where 
+    where
       ntype = cnodeType n
 
       pokeGeneral :: Int32 -> Int32 -> IO ()
-      pokeGeneral a1 a2 = do 
+      pokeGeneral a1 a2 = do
         pokeByteOff ptr 8 a1
         pokeByteOff ptr 16 a2
 
 
 instance Storable KernelNodeContents where
   alignment = const 8
-  sizeOf = const 24
+  sizeOf = const 32
   peek = error "Not implemented"
-  poke ptr contents = useAsCString (kernelName contents) $ \symbolC -> do
+  poke ptr contents = useAsCString (kernelName contents) $ \symbolC ->
+    useAsCString (prepKernelName contents) $ \symbolPrepC -> do
         pokeByteOff ptr 0 r
         pokeByteOff ptr 4 w
         p <- newCString $ modulePath contents
         pokeByteOff ptr 8 p
         pokeByteOff ptr 16 symbolC
+        pokeByteOff ptr 24 symbolPrepC
         where
-          r = aIdxToCRep $ head $ readAdresses contents 
-          w = aIdxToCRep $ head $ writeAdresses contents 
+          r = aIdxToCRep $ head $ readAdresses contents
+          w = aIdxToCRep $ head $ writeAdresses contents
 
 cnodeType :: NContent -> Int8
 cnodeType (CopyNode {}) = 0
@@ -161,8 +132,6 @@ cnodeType (Output {}) = 2
 cnodeType (EmptyNode {}) = 3
 -- cnodeType (AllocNode {}) = 4
 cnodeType (KernelNode {}) = 5
-
-
 
 addDeps :: NContent -> [NIndex] -> NContent
 addDeps (EmptyNode deps) = EmptyNode . (deps ++ )
@@ -191,7 +160,7 @@ convertFun (Slam lhs (Sbody body)) = let
   (lhsNodes, s) = convertLHS (lhsToTupR lhs) (ConvState M.empty M.empty M.empty)
   lhsenv = push' Empty (lhs, lhsNodes)
   s' = convertBody s lhsenv body Nothing
-  
+
   nodes'' = processSignalDependencies (nodes s') (events s')
   in trace ("events:" ++ prettyPrintMap (events s')) $ GraphProgram nodes'' (memDeps s')
 
@@ -203,7 +172,7 @@ processSignalDependencies ns es = foldr f ns (M.elems es)
                 then addDeps n incoming
                 else n
 
-data ConvState = ConvState 
+data ConvState = ConvState
   { nodes :: Nodes
   , memDeps :: MemoryMap
   , events :: Events
@@ -219,7 +188,7 @@ convertBody s@(ConvState {..}) env schedule prev = let
 
   Return -> s
 
-  (Spawn l r) -> let 
+  (Spawn l r) -> let
     s' = convertBody s env l prev
     in convertBody s' env r prev
 
@@ -231,7 +200,7 @@ convertBody s@(ConvState {..}) env schedule prev = let
   (Effect (SignalAwait signals) next) -> let
     idx = NodeIndex $ M.size nodes
     events' = updateEvents env idx signals events
-    in convertBody s {events = events'} env next prev 
+    in convertBody s {events = events'} env next prev
 
   (Effect (SignalResolve signals) next) -> let
     events' = case prev of
@@ -243,13 +212,13 @@ convertBody s@(ConvState {..}) env schedule prev = let
     events' = M.insert eventIdx (EventContents [] []) events
     env' =  push' env (lhs, (EventDependency eventIdx, EventResolver eventIdx))
     in convertBody s {events = events'} env' next prev
-  
-  (Alet lhs (RefRead rref) (Effect (RefWrite wref _) next)) -> 
-    case prj' (varIdx rref) env of 
+
+  (Alet lhs (RefRead rref) (Effect (RefWrite wref _) next)) ->
+    case prj' (varIdx rref) env of
       (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
         Refl -> let
 
-          idxIn = case envMemIdx rval of 
+          idxIn = case envMemIdx rval of
             (Just v) -> v
             _ -> error "RefRead invalid value"
 
@@ -271,7 +240,7 @@ convertBody s@(ConvState {..}) env schedule prev = let
     env' = push' env (lhs, BufferVal memIdx)
     in convertBody s {memDeps = memDeps'} env' next prev
   (Alet lhs (RefRead rref) next) ->
-    case prj' (varIdx rref) env of 
+    case prj' (varIdx rref) env of
       (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
         Refl -> let
           env' = push' env (lhs, rval)
@@ -280,11 +249,17 @@ convertBody s@(ConvState {..}) env schedule prev = let
   (Effect (RefWrite _ _) next) -> let
     in convertBody s env next prev
   (Effect (Exec metaData fun args) next) -> case kernelFunKernel fun of
-    (Exists kernel) -> let
-      obj = kernelPhaseObject $ kernelMain kernel
+    (Exists (PTXKernel {kernelMain, kernelPrepGen})) -> let
+      obj = kernelPhaseObject kernelMain
+
+      -- prepCodeGen = prepKernelCodeGen env args undefined
+      --prepMod = _
+      prepObj = unsafePerformIO $ evalPTX defaultTarget $ compilePrep (snd kernelPrepGen) (fst kernelPrepGen) (env, args)
+      -- prepObj = undefined
       -- TODO: Get proper in and out adresses
       -- 
-      content = KernelNodeContents [AIndex 0] [AIndex 1] (objPath obj) (objSym obj)
+      content = trace (objPath prepObj) $ KernelNodeContents [AIndex 0] [AIndex 1] (objPath obj) (objSym obj) (objSym prepObj)
+
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
       -- Dependency sets link from first input to first output
       memDeps' = M.adjust (AIndex 0 :) (AIndex 1) memDeps
@@ -293,12 +268,7 @@ convertBody s@(ConvState {..}) env schedule prev = let
 
   _ -> error "Unexpected body contents in schedule."
 
-type PrepKernel env = Ptr (SizedArray Word) -> Ptr (Struct (MarshalEnv env)) -> ()
 
-generatePrepareKernel :: PTXKernel a -> LLVM PTX (ObjectR (PrepKernel a))
-generatePrepareKernel kernel = do
-  _ <- codeGenKernel undefined undefined undefined undefined undefined
-  compile undefined undefined undefined undefined
 
 
 updateEvents :: Env GraphEnv env -> NIndex -> [Idx env t] -> Events -> Events
@@ -320,32 +290,32 @@ convertLHS tup s@(ConvState {..}) = let
 -- input argument
   (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref scalarOrBuffer)) ->
     ( ( EventDependency eventIdx
-      , RefVal $ case scalarOrBuffer of 
+      , RefVal $ case scalarOrBuffer of
         (GroundRscalar tp) -> ScalarVal memIdx tp
         (GroundRbuffer _) ->  BufferVal memIdx
       )
-    , s 
+    , s
       { nodes = M.insert nodeIdx (Input memIdx) nodes
       , memDeps = M.insert memIdx [] memDeps
       , events = M.insert eventIdx (EventContents [nodeIdx] []) events
-      } 
+      }
     )
 -- output argument
   (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite scalarOrBuffer)) ->
     ( ( EventResolver eventIdx
-      , OutRefVal $ case scalarOrBuffer of 
+      , OutRefVal $ case scalarOrBuffer of
         (GroundRscalar tp) -> ScalarVal memIdx tp
         (GroundRbuffer _) -> BufferVal memIdx
       )
-    , s 
+    , s
       { nodes = M.insert nodeIdx (Output memIdx []) nodes
       , memDeps = M.insert memIdx [] memDeps
       , events = M.insert eventIdx (EventContents [] [nodeIdx]) events
-      } 
+      }
     )
-  (TupRpair l r) -> let 
+  (TupRpair l r) -> let
     (vl, s') = convertLHS l s
-    (vr, s'') = convertLHS r s' 
+    (vr, s'') = convertLHS r s'
     in ((vl, vr), s'')
   _ -> error "Unexpected types in the input or output of an Acc function"
 
@@ -362,9 +332,6 @@ prettyPrintMap m = unlines $ map (\k -> show k ++ ": " ++ show (m M.! k)) $ M.ke
 
 instance Show NIndex where
   show (NodeIndex i) = "n" ++ show i
-instance Show AIndex where
-  -- show (SomeAllocationIndex _ i) = "d" ++ show i
-  show (AIndex i) = "d" ++ show i
 
 data HostAllocation where
   ScalarAllocation :: Buffer t -> HostAllocation
@@ -394,8 +361,8 @@ incrementIndex :: Pass1 -> Pass1
 incrementIndex p@(Pass1 {currentIndex}) = case currentIndex of
   (AIndex i) -> p{currentIndex = AIndex (i + 1)}
 
-foreign import ccall unsafe "run_graph" run_graph_c
-  :: Word32 -- Nodecount
+type RunGraphF =
+  Word32 -- Nodecount
   -> Ptr Word32 -- Node dependency counts
   -> Ptr (Ptr Word32) -- Node dependencies
   -> Ptr NContent -- Node contents
@@ -406,6 +373,20 @@ foreign import ccall unsafe "run_graph" run_graph_c
   -> Ptr (StablePtr PrimMVar) -- Output mvars
   -> StablePtr PrimMVar -- Done Mvar
   -> IO ()
+
+-- SEE: [HLS and GHC IDE]
+--
+
+
+foreign import ccall unsafe "run_graph" run_graph_c
+  :: RunGraphF
+
+
+
+
+
+
+
 
 runGraphProgram :: GraphProgram -> TupR BaseR t -> t -> IO ()
 runGraphProgram (GraphProgram n a) tup v = do

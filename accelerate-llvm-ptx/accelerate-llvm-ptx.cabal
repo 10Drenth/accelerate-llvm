@@ -89,9 +89,10 @@ Library
 
     Data.Array.Accelerate.LLVM.PTX.Link
     Data.Array.Accelerate.LLVM.PTX.Link.Graph
+    Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel
+    Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment
     Data.Array.Accelerate.LLVM.PTX.Link.Cache
     Data.Array.Accelerate.LLVM.PTX.Link.Object
-
     -- Data.Array.Accelerate.LLVM.PTX.Embed
 
     -- System.Process.Extra

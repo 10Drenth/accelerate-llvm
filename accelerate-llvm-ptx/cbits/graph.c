@@ -314,6 +314,7 @@ void run_graph
             printf("Kernel from %d to %d", content.content.kernel.alloc_1, content.content.kernel.alloc_2);
             printf("\nKernel module: %s", content.content.kernel.module_path);
             printf("\nKernel symbol: %s", content.content.kernel.symbol);
+            printf("\nKernel prep symbol: %s", content.content.kernel.prep_symbol);
             
             CUmodule mod;
             printf("\nLoading module");
