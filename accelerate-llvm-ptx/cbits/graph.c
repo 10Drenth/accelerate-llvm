@@ -338,6 +338,7 @@ void run_graph
             size_t psize;
             CU_CHECK(cuFuncGetParamInfo(kernel_func, 0, &poffset, &psize));
             CU_CHECK(cuFuncGetParamInfo(kernel_func, 1, &poffset, &psize));
+            CU_CHECK(cuFuncGetParamInfo(kernel_func, 2, &poffset, &psize));
             printf("\nDone getting param info");
             
             CUDA_KERNEL_NODE_PARAMS kernel_params;
@@ -345,6 +346,7 @@ void run_graph
             kernel_params.blockDimX = kernel_params.blockDimY = kernel_params.blockDimZ = 1;
             kernel_params.gridDimX = kernel_params.gridDimY = kernel_params.gridDimZ = 1;
             kernel_params.ctx = cuContext;
+            printf("\ncheck1");
 
             // This would be example contents of the param struct
             // struct KernelArguments kArgs;
@@ -355,16 +357,25 @@ void run_graph
             CUdeviceptr npointer; 
             // CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
             // CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
-            CUdeviceptr params_ptr;
-            printf("\nAllocating param struct");
-            CU_CHECK(cuMemAlloc(&params_ptr, 2 * sizeof(CUdeviceptr))); //acquire actual bytesize of argument struct
+            // CUdeviceptr params_ptr;
+            // printf("\nAllocating param struct");
+            // CU_CHECK(cuMemAlloc(&params_ptr, 2 * sizeof(CUdeviceptr))); //acquire actual bytesize of argument struct
  
-            void *args[] = {&npointer, &params_ptr};
-            // void *args[] = {&npointer, &input_ptr, &output_ptr};
+            // void *args[] = {&npointer, &params_ptr};
+            printf("\ncheck2");
+            void *args[] = {&npointer, &dev_pointers[k_a1], &dev_pointers[k_a2]};
+            CUdeviceptr arg1 = (CUdeviceptr)(mem + mem_offsets[k_a1]);
+            CUdeviceptr arg2 = (CUdeviceptr)(mem + mem_offsets[k_a2]);
+            void *args[] = {&npointer, &arg1, &arg2};
+            printf("\ncheck3");
             kernel_params.kernelParams = args;
+            printf("\ncheck4");
             kernel_params.func = kernel_func;
+            printf("\ncheck5");
 
+            printf("\nAdding kernel node");
             CU_CHECK(cuGraphAddKernelNode(&new_node, graph, dependencies, dependency_count, &kernel_params));
+            printf("\nDone adding kernel node");
             break;
         default:
             break;

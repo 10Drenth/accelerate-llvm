@@ -298,10 +298,10 @@ makeKernel
 makeKernel name env =
   ( gamma
   , \postfix body ->
-    snd <$> codeGenKernel (name ++ postfix) (LLVM.Lam kernelDataRawType "kernel_data" . LLVM.Lam (PtrPrimType structTp defaultAddrSpace) "env") (extractEnv >> body)
+    snd <$> codeGenKernel (name ++ postfix) (LLVM.Lam kernelDataRawType "kernel_data" . bindArgs) (extractEnv >> body)
   )
   where
-    (structTp, extractEnv, gamma) = bindEnvFromStruct @PTX env
+    (bindArgs, extractEnv, gamma) = bindEnvArgs @PTX env
     kernelDataRawType :: PrimType (Ptr (SizedArray Word))
     kernelDataRawType = PtrPrimType (ArrayPrimType 0 primType) defaultAddrSpace
 
