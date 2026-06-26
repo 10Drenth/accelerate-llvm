@@ -7,6 +7,7 @@
 struct NodeContent;
 struct GraphProgram;
 typedef enum {NODE_COPY, NODE_INPUT, NODE_OUTPUT, NODE_EMPTY, NODE_ALLOC, NODE_KERNEL} NodeType;
+typedef enum {MEM_SCALAR, MEM_BUFFER} MemType;
 
 
 struct NodeContent {
@@ -19,6 +20,10 @@ struct NodeContent {
             char* symbol; // Size 8, alignment 8
             char* prep_symbol; // Size 8, alignment 8
         } kernel; // Size 32, alignment 8
+        struct {
+            uint32_t alloc_1;
+            uint32_t alloc_2;
+        } copy;
         struct {
             uint32_t alloc_1;
             uint32_t alloc_2;
@@ -56,6 +61,9 @@ void run_graph
     , uint32_t **node_dependencies
     , struct NodeContent *node_contents
     , uint32_t allocation_count
+    , uint32_t mem_bytesize
+    , uint32_t *mem_offsets
+    , int8_t *mem_types
     , uint32_t *input_bytesizes
     , char **input_data
     , char **output_data

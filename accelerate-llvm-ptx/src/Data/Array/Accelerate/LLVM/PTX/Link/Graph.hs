@@ -46,16 +46,14 @@ import Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel (compilePrep)
 
 
 
-data GraphProgram = GraphProgram Nodes MemoryMap
+data GraphProgram = GraphProgram Nodes MemoryMap GraphMemory
 
 newtype NIndex = NodeIndex Int
   deriving (Eq, Ord)
-aIdxToCRep :: AIndex -> Int32
-aIdxToCRep (AIndex v) = fromIntegral v
 
 
 type Nodes = M.Map NIndex NContent
-type MemoryMap = M.Map AIndex [AIndex]
+type MemoryMap = M.Map MIdx [MIdx]
 
 data EventContents = EventContents [NIndex] -- Incoming
                                    [NIndex] -- Outgoing
@@ -65,8 +63,8 @@ type Events = M.Map EventIndex EventContents
 
 
 data KernelNodeContents = KernelNodeContents
-  { readAdresses :: [AIndex]
-  , writeAdresses :: [AIndex]
+  { readAdresses :: [MIdx]
+  , writeAdresses :: [MIdx]
   , modulePath :: FilePath
   , kernelName :: ShortByteString
   , prepKernelName :: ShortByteString
@@ -74,10 +72,10 @@ data KernelNodeContents = KernelNodeContents
   deriving (Show)
 
 data NContent = CopyNode [NIndex] -- Dependencies
-                            AIndex -- From
-                            AIndex -- To
-                 | Input AIndex
-                 | Output AIndex [NIndex] -- Dependencies
+                            MIdx -- From
+                            MIdx -- To
+                 | Input MIdx
+                 | Output MIdx [NIndex] -- Dependencies
                  | EmptyNode [NIndex] -- Dependencies
                 --  | AllocNode AIndex -- Target adress
                 --              Int -- Element bytesize TODO: Implement (for now ignored)
@@ -92,21 +90,22 @@ instance Storable NContent where
   sizeOf = const 40
   peek = error "Not implemented"
   poke ptr n = do
-    pokeByteOff ptr 0 ntype
+    pokeByteOff ptr 0 (cnodeType n)
     case n of
-      (CopyNode _ a1 a2) -> pokeGeneral (aIdxToCRep a1) (aIdxToCRep a2)
-      (Input a) -> pokeGeneral (aIdxToCRep a) 0
-      (Output a _) -> pokeGeneral (aIdxToCRep a) 0
-      (EmptyNode {}) -> pokeGeneral 0 0
+      (CopyNode _ a1 a2) -> do
+        pokeGeneral a1 a2
+
+      (Input a) -> pokeGeneral a (MIdx 0)
+      (Output a _) -> pokeGeneral a (MIdx 0)
+      (EmptyNode {}) -> pokeGeneral (MIdx 0) (MIdx 0)
       -- (AllocNode {}) -> 4
       (KernelNode _ v) -> pokeByteOff ptr 8 v
     where
-      ntype = cnodeType n
-
-      pokeGeneral :: Int32 -> Int32 -> IO ()
+      pokeGeneral :: MIdx -> MIdx -> IO ()
       pokeGeneral a1 a2 = do
         pokeByteOff ptr 8 a1
-        pokeByteOff ptr 16 a2
+        pokeByteOff ptr 12 a2
+      
 
 
 instance Storable KernelNodeContents where
@@ -122,8 +121,8 @@ instance Storable KernelNodeContents where
         pokeByteOff ptr 16 symbolC
         pokeByteOff ptr 24 symbolPrepC
         where
-          r = aIdxToCRep $ head $ readAdresses contents
-          w = aIdxToCRep $ head $ writeAdresses contents
+          r = head $ readAdresses contents
+          w = head $ writeAdresses contents
 
 cnodeType :: NContent -> Int8
 cnodeType (CopyNode {}) = 0
@@ -145,7 +144,7 @@ addDeps (KernelNode deps c) = \d -> KernelNode (deps ++ d) c
 getDeps :: NContent -> [NIndex]
 getDeps (EmptyNode deps) = deps
 getDeps (Output _ deps) = deps
-getDeps (CopyNode deps _ _) = deps
+getDeps (CopyNode deps _ _ ) = deps
 getDeps (Input _) = []
 -- getDeps (AllocNode _ _ _ deps) = deps
 getDeps (KernelNode deps _) = deps
@@ -157,12 +156,12 @@ convertFun :: forall t. UniformScheduleFun PTXKernel () t -> GraphProgram
 convertFun (Sbody _) = error ""
 convertFun (Slam lhs1 (Slam lhs2 f)) = convertFun (Slam (LeftHandSidePair lhs1 lhs2) f)
 convertFun (Slam lhs (Sbody body)) = let
-  (lhsNodes, s) = convertLHS (lhsToTupR lhs) (ConvState M.empty M.empty M.empty)
+  (lhsNodes, s) = convertLHS (lhsToTupR lhs) (ConvState M.empty (0, M.empty) M.empty M.empty)
   lhsenv = push' Empty (lhs, lhsNodes)
   s' = convertBody s lhsenv body Nothing
 
   nodes'' = processSignalDependencies (nodes s') (events s')
-  in trace ("events:" ++ prettyPrintMap (events s')) $ GraphProgram nodes'' (memDeps s')
+  in trace ("events:" ++ prettyPrintMap (events s')) $ GraphProgram nodes'' (memDeps s') (mem s')
 
 processSignalDependencies :: Nodes -> Events -> Nodes
 processSignalDependencies ns es = foldr f ns (M.elems es)
@@ -174,6 +173,7 @@ processSignalDependencies ns es = foldr f ns (M.elems es)
 
 data ConvState = ConvState
   { nodes :: Nodes
+  , mem :: GraphMemory
   , memDeps :: MemoryMap
   , events :: Events
   }
@@ -183,7 +183,7 @@ convertBody :: ConvState -> Env GraphEnv env -> UniformSchedule PTXKernel env ->
 convertBody s@(ConvState {..}) env schedule prev = let
   nodeIdx = NodeIndex $ M.size nodes
   eventIdx = EventIndex $ M.size events
-  memIdx = AIndex $ M.size memDeps
+  -- memIdx = AIndex (M.size memDeps) 0
   in case schedule of
 
   Return -> s
@@ -218,13 +218,13 @@ convertBody s@(ConvState {..}) env schedule prev = let
       (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
         Refl -> let
 
-          idxIn = case envMemIdx rval of
+          idxIn = case envMemKey rval of
             (Just v) -> v
             _ -> error "RefRead invalid value"
 
           env' = push' env (lhs, rval)
 
-          idxOut = case envMemIdx $ prj' (varIdx wref) env' of
+          idxOut = case envMemKey $ prj' (varIdx wref) env' of
             (Just v) -> v
             _ -> error "RefWrite invalid value"
 
@@ -236,9 +236,9 @@ convertBody s@(ConvState {..}) env schedule prev = let
 
 -- BEGIN TODO
   (Alet lhs (Alloc sh tp vs) next) -> let
-    memDeps' = memDeps --M.insert memIdx [] memDeps
-    env' = push' env (lhs, BufferVal memIdx)
-    in convertBody s {memDeps = memDeps'} env' next prev
+    (mem', k) = reserveMemory MBuffer (sizeOf (0 :: Int)) (sizeOf (0 :: Int)) mem
+    env' = push' env (lhs, BufferVal k)
+    in convertBody s {mem = mem'} env' next prev
   (Alet lhs (RefRead rref) next) ->
     case prj' (varIdx rref) env of
       (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
@@ -258,11 +258,11 @@ convertBody s@(ConvState {..}) env schedule prev = let
       -- prepObj = undefined
       -- TODO: Get proper in and out adresses
       -- 
-      content = trace (objPath prepObj) $ KernelNodeContents [AIndex 0] [AIndex 1] (objPath obj) (objSym obj) (objSym prepObj)
+      content = trace (objPath prepObj) $ KernelNodeContents [MIdx 0] [MIdx 1] (objPath obj) (objSym obj) (objSym prepObj)
 
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
       -- Dependency sets link from first input to first output
-      memDeps' = M.adjust (AIndex 0 :) (AIndex 1) memDeps
+      memDeps' = M.adjust (MIdx 0 :) (MIdx 1) memDeps
       in convertBody s {nodes = nodes', memDeps = memDeps'} env next (Just nodeIdx)
 -- END TODO
 
@@ -283,36 +283,35 @@ convertLHS :: BasesR t -> ConvState -> (Distribute GraphEnv t, ConvState)
 convertLHS tup s@(ConvState {..}) = let
   nodeIdx = NodeIndex $ M.size nodes
   eventIdx = EventIndex $ M.size events
-  memIdx = AIndex $ M.size memDeps
   in case tup of
 -- Unit
   TupRunit -> ((), s)
 -- input argument
   (TupRsingle BaseRsignal `TupRpair` TupRsingle (BaseRref scalarOrBuffer)) ->
     ( ( EventDependency eventIdx
-      , RefVal $ case scalarOrBuffer of
-        (GroundRscalar tp) -> ScalarVal memIdx tp
-        (GroundRbuffer _) ->  BufferVal memIdx
+      , RefVal val
       )
     , s
-      { nodes = M.insert nodeIdx (Input memIdx) nodes
-      , memDeps = M.insert memIdx [] memDeps
+      { nodes = M.insert nodeIdx (Input memKey) nodes
+      , memDeps = M.insert memKey [] memDeps
       , events = M.insert eventIdx (EventContents [nodeIdx] []) events
+      , mem = mem'
       }
     )
+    where (val, mem', memKey) = reserveGround scalarOrBuffer mem
 -- output argument
   (TupRsingle BaseRsignalResolver `TupRpair` TupRsingle (BaseRrefWrite scalarOrBuffer)) ->
     ( ( EventResolver eventIdx
-      , OutRefVal $ case scalarOrBuffer of
-        (GroundRscalar tp) -> ScalarVal memIdx tp
-        (GroundRbuffer _) -> BufferVal memIdx
+      , OutRefVal val
       )
     , s
-      { nodes = M.insert nodeIdx (Output memIdx []) nodes
-      , memDeps = M.insert memIdx [] memDeps
+      { nodes = M.insert nodeIdx (Output memKey []) nodes
+      , memDeps = M.insert memKey [] memDeps
       , events = M.insert eventIdx (EventContents [] [nodeIdx]) events
+      , mem = mem'
       }
     )
+    where (val, mem', memKey) = reserveGround scalarOrBuffer mem
   (TupRpair l r) -> let
     (vl, s') = convertLHS l s
     (vr, s'') = convertLHS r s'
@@ -320,11 +319,14 @@ convertLHS tup s@(ConvState {..}) = let
   _ -> error "Unexpected types in the input or output of an Acc function"
 
 instance Show GraphProgram where
-  show (GraphProgram ns as) = "\n\n===Node Graph==\n"
-                            ++ prettyPrintMap ns
-                            ++ "\n\n===Data Graph===\n"
-                            ++ prettyPrintMap as
-                            ++ "\n\n"
+  show (GraphProgram ns as (bs, m)) = "\n\n===Node Graph==\n"
+                                    ++ prettyPrintMap ns
+                                    ++ "\n\n===Data Graph===\n"
+                                    ++ prettyPrintMap as
+                                    ++ "\n\n===Mem offset===\n"
+                                    ++ prettyPrintMap m
+                                    ++ "\nMem bytesize: " ++ show bs
+                                    ++ "\n\n"
 
 prettyPrintMap :: (Ord k, Show k, Show v) => M.Map k v -> String
 prettyPrintMap m = unlines $ map (\k -> show k ++ ": " ++ show (m M.! k)) $ M.keys m
@@ -337,12 +339,12 @@ data HostAllocation where
   ScalarAllocation :: Buffer t -> HostAllocation
   BufferAllocation :: Buffer t -> HostAllocation
 
-type InputValues = M.Map AIndex HostAllocation
-type OutputAllocations = M.Map AIndex HostAllocation
-type OutWrites = M.Map AIndex (MVar () -> OutputAllocations -> IO ())
+type InputValues = M.Map MIdx HostAllocation
+type OutputAllocations = M.Map MIdx HostAllocation
+type OutWrites = M.Map MIdx (MVar () -> OutputAllocations -> IO ())
 
 
-allocateHostOutBuffers :: M.Map AIndex Int -> IO OutputAllocations
+allocateHostOutBuffers :: M.Map MIdx Int -> IO OutputAllocations
 allocateHostOutBuffers = mapM f
   where
     f :: Int -> IO HostAllocation
@@ -351,15 +353,15 @@ allocateHostOutBuffers = mapM f
       return $ BufferAllocation (Buffer ptr)
 
 data Pass1 = Pass1
-           { currentIndex :: AIndex
-           , inputSizes :: M.Map AIndex Int
+           { currentIndex :: MIdx
+           , inputSizes :: M.Map MIdx Int
            , inputValues :: InputValues
            , outputWriteOps :: OutWrites
            }
 
 incrementIndex :: Pass1 -> Pass1
 incrementIndex p@(Pass1 {currentIndex}) = case currentIndex of
-  (AIndex i) -> p{currentIndex = AIndex (i + 1)}
+  (MIdx i) -> p{currentIndex = MIdx (i + 1)}
 
 type RunGraphF =
   Word32 -- Nodecount
@@ -367,6 +369,9 @@ type RunGraphF =
   -> Ptr (Ptr Word32) -- Node dependencies
   -> Ptr NContent -- Node contents
   -> Word32 -- Alloc count
+  -> Word32 -- Memory bytesize
+  -> Ptr Word32 -- Memory offsets
+  -> Ptr Int8 -- Memory types
   -> Ptr Word32 -- input bytesizes
   -> Ptr (Ptr Word8) -- Input data
   -> Ptr (Ptr Word8) -- Output data
@@ -374,25 +379,15 @@ type RunGraphF =
   -> StablePtr PrimMVar -- Done Mvar
   -> IO ()
 
--- SEE: [HLS and GHC IDE]
---
-
 
 foreign import ccall unsafe "run_graph" run_graph_c
   :: RunGraphF
 
-
-
-
-
-
-
-
 runGraphProgram :: GraphProgram -> TupR BaseR t -> t -> IO ()
-runGraphProgram (GraphProgram n a) tup v = do
+runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
 
   p1 <- inspectInputAllocSizes tup v $ Pass1
-    { currentIndex = AIndex 0
+    { currentIndex = MIdx 0
     , inputSizes = M.empty
     , inputValues = M.empty
     , outputWriteOps = M.empty
@@ -410,14 +405,20 @@ runGraphProgram (GraphProgram n a) tup v = do
   let
     node_count = M.size n
     n_nodes_c = (fromIntegral node_count :: Word32)
-    bytesizes' = [fromIntegral (bytesizes M.! AIndex i) | i <- [0..(alloc_count-1)]]
+    memOffsets' = map fromIntegral $ memoryOffsets mem
+    memTypes' = memoryTypes mem
+    bytesizes' = [fromIntegral (bytesizes M.! MIdx (fromIntegral i) ) | i <- [0..(alloc_count-1)]]
     alloc_count = M.size a
     alloc_count_c = (fromIntegral alloc_count :: Word32)
+    memEntryCount = length memOffsets'
+    mem_bytesize_c = (fromIntegral memBytesize :: Word32)
     (node_dependency_counts, node_dependencies) = getNodeDependencies n
     n_outputs = M.size (outputWriteOps p1)
 
   node_dependency_counts_fp <- mallocForeignPtrArray node_count
-  node_contents_fp <- mallocForeignPtrArray $ node_count
+  node_contents_fp <- mallocForeignPtrArray node_count
+  mem_offsets_fp <- mallocForeignPtrArray memEntryCount
+  mem_types_fp <- mallocForeignPtrArray memEntryCount
   bytesizes_fp <- mallocForeignPtrArray alloc_count
   input_data_fp <- mallocForeignPtrArray (M.size $ inputSizes p1)
   output_data_fp <- mallocForeignPtrArray alloc_count
@@ -434,36 +435,41 @@ runGraphProgram (GraphProgram n a) tup v = do
 
         withForeignPtr node_contents_fp $ \node_contents_c -> do
           pokeArray node_contents_c (ascElems n)
-
           withForeignPtr bytesizes_fp $ \bytesizes_c -> do
             pokeArray bytesizes_c bytesizes'
 
-            withFps (map getHostAllocFp (ascElems (inputValues p1))) $ \input_data_ptrs -> do
-              withForeignPtr input_data_fp $ \input_data_c -> do
-                pokeArray input_data_c input_data_ptrs
-                withFps (map getHostAllocFp (ascElems outputBuffers)) $ \output_data_ptrs -> do
-                  withForeignPtr output_mvars_fp $ \output_mvars_c -> do
-                    mvars <- mapM (\aid -> do
-                        mvar <- newEmptyMVar
-                        case outputWriteOps p1 M.!? aid of
-                          (Just op) -> op mvar outputBuffers
-                          Nothing -> return ()
-                        return mvar
-                        ) (M.keys a)
-                    mvarPtrs <- mapM newStablePtrPrimMVar mvars
-                    pokeArray output_mvars_c mvarPtrs
+            withForeignPtr mem_offsets_fp $ \mem_offsets_c -> do
+              pokeArray mem_offsets_c memOffsets'
+            
+              withForeignPtr mem_types_fp $ \mem_types_c -> do
+                pokeArray mem_types_c memTypes'
 
-                    withForeignPtr output_data_fp $ \output_data_c -> do
-                      pokeArray output_data_c output_data_ptrs
+                withFps (map getHostAllocFp (ascElems (inputValues p1))) $ \input_data_ptrs -> do
+                  withForeignPtr input_data_fp $ \input_data_c -> do
+                    pokeArray input_data_c input_data_ptrs
+                    withFps (map getHostAllocFp (ascElems outputBuffers)) $ \output_data_ptrs -> do
+                      withForeignPtr output_mvars_fp $ \output_mvars_c -> do
+                        mvars <- mapM (\aid -> do
+                            mvar <- newEmptyMVar
+                            case outputWriteOps p1 M.!? aid of
+                              (Just op) -> op mvar outputBuffers
+                              Nothing -> return ()
+                            return mvar
+                            ) (M.keys a)
+                        mvarPtrs <- mapM newStablePtrPrimMVar mvars
+                        pokeArray output_mvars_c mvarPtrs
+
+                        withForeignPtr output_data_fp $ \output_data_c -> do
+                          pokeArray output_data_c output_data_ptrs
 
 
-                      putStrLn "starting C runtime from haskell.."
-                      run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c node_contents_c alloc_count_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
-                      putStrLn "waiting.."
-                      _ <- takeMVar doneMVar
-                      putStrLn "Done!"
-                      mapM_ (`putMVar` ()) mvars
-                      putStrLn "Done resolving outputs!"
+                          putStrLn "starting C runtime from haskell.."
+                          run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c node_contents_c alloc_count_c mem_bytesize_c mem_offsets_c mem_types_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
+                          putStrLn "waiting.."
+                          _ <- takeMVar doneMVar
+                          putStrLn "Done!"
+                          mapM_ (`putMVar` ()) mvars
+                          putStrLn "Done resolving outputs!"
 
 
 
@@ -567,19 +573,19 @@ inspectInputAllocSizes (TupRpair t1 t2) (v1, v2) p = do
   inspectInputAllocSizes t2 v2 p'
 inspectInputAllocSizes _ _  _ = internalError "Unexpected types in the input or output of an Acc function"
 
-writeOutputScalar :: AIndex -> ScalarType e -> IORef e -> M.Map AIndex HostAllocation -> IO ()
+writeOutputScalar :: MIdx -> ScalarType e -> IORef e -> M.Map MIdx HostAllocation -> IO ()
 writeOutputScalar idx tp ref m = let buf = getValue idx m in writeIORef ref (indexBuffer tp buf 0)
 
-writeOutputBuffer :: AIndex -> IORef (Buffer e) -> M.Map AIndex HostAllocation -> IO ()
+writeOutputBuffer :: MIdx -> IORef (Buffer e) -> M.Map MIdx HostAllocation -> IO ()
 writeOutputBuffer idx ref m = let buf = getValue idx m in writeIORef ref buf
 
-getValue :: AIndex -> M.Map AIndex HostAllocation -> Buffer e
+getValue :: MIdx -> M.Map MIdx HostAllocation -> Buffer e
 getValue idx m = case m M.! idx of BufferAllocation (Buffer p) -> Buffer (castForeignPtr p)
                                    ScalarAllocation (Buffer p) -> Buffer (castForeignPtr p)
 
 
 
-propagateAllocSizes :: MemoryMap -> M.Map AIndex Int -> M.Map AIndex Int
+propagateAllocSizes :: MemoryMap -> M.Map MIdx Int -> M.Map MIdx Int
 propagateAllocSizes deps sizes | all (`M.member` sizes) (M.keys deps) = sizes
                                | otherwise = let
                                   remainingKeys = filter (\k -> not (M.member k sizes)) (M.keys deps)

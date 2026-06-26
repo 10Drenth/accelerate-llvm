@@ -1,44 +1,87 @@
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 
-module Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment where
+module Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment 
+(memoryOffsets, memoryTypes, reserveMemory, envMemKey, reserveGround, GraphEnv (..), EventIndex (..), GMEntry (..), MIdx (..), GraphMemory, MEntryType (..))
+ where
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.Array.Buffer
 import Data.Array.Accelerate.AST.Schedule.Uniform
 import Data.Array.Accelerate.Representation.Type
 import Data.Data
+import LLVM.AST.Type.Representation (makeAligned)
+import qualified Data.Map as M
+import Data.Array.Accelerate.Representation.Elt
+import Foreign
 
 data GraphEnv t where
-  ScalarVal :: AIndex -> !(ScalarType t) -> GraphEnv t
-  BufferVal :: AIndex -> GraphEnv (Buffer t)
+  ScalarVal :: MIdx -> !(ScalarType t) -> GraphEnv t
+  BufferVal :: MIdx -> GraphEnv (Buffer t)
   RefVal :: GraphEnv t -> GraphEnv (Ref t)
   OutRefVal :: GraphEnv t -> GraphEnv (OutputRef t)
   EventDependency :: EventIndex -> GraphEnv Signal
   EventResolver :: EventIndex -> GraphEnv SignalResolver
 
-newtype EventIndex = EventIndex Int
+envMemKey :: GraphEnv t -> Maybe MIdx
+envMemKey (ScalarVal idx _) = Just idx
+envMemKey (BufferVal idx) = Just idx
+envMemKey (RefVal v) = envMemKey v
+envMemKey (OutRefVal v) = envMemKey v
+envMemKey _ = Nothing
+
+
+type GraphMemory = (Int, M.Map MIdx GMEntry)
+
+newtype MIdx = MIdx Int32 -- indeces
+  deriving (Eq, Ord, Show)
+data GMEntry = GMEntry 
+  Int32 -- offset
+  MEntryType -- Scalar or Buffer
+  deriving (Eq, Ord, Show)
+data MEntryType = MScalar | MBuffer
   deriving (Eq, Ord, Show)
 
-newtype AIndex = AIndex Int
-  deriving (Eq, Ord)
+gmEntryOffset :: GMEntry -> Int32
+gmEntryOffset (GMEntry v _) = v
 
--- instance Show (GraphEnv t) where
---   show (InputEvent eIdx nIdx) = "Input event " ++ show eIdx ++ ": " ++ show nIdx
---   show (OutputEvent eIdx nIdx) = "Ouptut event " ++ show eIdx ++ ": " ++ show nIdx
---   show (ScalarVal idx _) = "ScalarVal: " ++ show idx
---   show (BufferVal idx _) = "BufferVal: " ++ show idx
---   show (EventDependency idx) = "EventDependecy: " ++ show idx
---   show (EventResolver idx) = "EventResolver: " ++ show idx
-envMemIdx :: GraphEnv t -> Maybe AIndex
-envMemIdx (ScalarVal idx _) = Just idx
-envMemIdx (BufferVal idx) = Just idx
-envMemIdx (RefVal v) = envMemIdx v
-envMemIdx (OutRefVal v) = envMemIdx v
-envMemIdx _ = Nothing
+gmEntryType :: GMEntry -> Int8
+gmEntryType (GMEntry _ MScalar) =  0
+gmEntryType (GMEntry _ MBuffer) =  1
 
-instance Show AIndex where
-  -- show (SomeAllocationIndex _ i) = "d" ++ show i
-  show (AIndex i) = "d" ++ show i
+
+memoryOffsets :: GraphMemory -> [Int32]
+memoryOffsets (_, m) = let n = M.size m in 
+  [gmEntryOffset (m M.! MIdx (fromIntegral i) ) 
+  | i <- [0..(n-1)]
+  ]
+memoryTypes :: GraphMemory -> [Int8]
+memoryTypes (_, m) = let n = M.size m in 
+  [gmEntryType (m M.! MIdx (fromIntegral i) ) 
+  | i <- [0..(n-1)]
+  ]
+
+reserveMemory :: MEntryType -> Int -> Int -> GraphMemory -> (GraphMemory, MIdx)
+reserveMemory tp byteSize al (cursor, xs) = let 
+    cursor' = makeAligned cursor al
+    key = MIdx $ fromIntegral $ M.size xs
+  in( ( cursor' + byteSize
+      , M.insert key (GMEntry (fromIntegral cursor') tp) xs
+      )
+    , key
+    )
+
+reserveGround :: GroundR t -> GraphMemory -> (GraphEnv t, GraphMemory, MIdx)
+reserveGround (GroundRscalar tp) mem = let
+  (sz, al) = scalarTypeSizeAlignment tp
+  (m, k) = reserveMemory MScalar sz al mem 
+  in (ScalarVal k tp, m, k)
+reserveGround (GroundRbuffer _) mem = let 
+  (m, k) = reserveMemory MBuffer (sizeOf (0 :: Int)) (sizeOf (0 :: Int)) mem
+   in (BufferVal k, m, k)
+
+newtype EventIndex = EventIndex Int
+  deriving (Eq, Ord, Show)
 
 instance Distributes GraphEnv where
   reprIsSingle (ScalarVal _ tp) = reprIsSingle tp
@@ -50,3 +93,22 @@ instance Distributes GraphEnv where
 
   pairImpossible (ScalarVal _ tp) = pairImpossible tp
   unitImpossible (ScalarVal _ tp) = unitImpossible tp
+
+instance Storable MIdx where
+  sizeOf = const (sizeOf (0 :: Int32))
+  alignment = const (alignment (0 :: Int32))
+  peek p = MIdx <$> peek (castPtr p)
+  poke p (MIdx v) = poke (castPtr p) v
+
+instance Storable MEntryType where
+  sizeOf = const (sizeOf (0 :: Int8))
+  alignment = const (alignment (0 :: Int8))
+  peek p = do
+    (v :: Int8) <- peek (castPtr p)
+    return $ case v of 
+      0 -> MScalar
+      1 -> MBuffer
+      _ -> error "Invalid entrytype"
+  poke p v = poke (castPtr p) $ case v of
+    MScalar -> (0 :: Int8)
+    MBuffer -> 1
