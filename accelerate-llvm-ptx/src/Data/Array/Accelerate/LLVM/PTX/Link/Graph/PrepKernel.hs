@@ -48,9 +48,9 @@ import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch
 
 
 
-type PrepEnv env = Ptr (SizedArray Word)
+type PrepEnv env = Ptr (Struct (KernelArgPtrs env))
 
-type PrepKernel env env' = PrepEnv env -> Ptr (SizedArray Word) -> Ptr (Struct (KernelArgs env')) -> ()
+type PrepKernel env = PrepEnv env -> Ptr (SizedArray Word) -> Ptr (Struct (KernelArgs env)) -> ()
 
 type PrepContext env f = (Env GraphEnv env, SArgs env f)
 
@@ -64,6 +64,10 @@ type family KernelArgs f where
   KernelArgs (t -> f) = (KernelArg t, KernelArgs f)
 
 
+type family KernelArgPtrs f where 
+  KernelArgPtrs () = ()
+  KernelArgPtrs (t -> f) = (Ptr (KernelArg t), KernelArgPtrs f)
+
 -- Exists Idx env
 -- IPV lijst Tupr gebruiken als mapping naar de kleine environment Tupr
 -- TupR (Idx genv) kenv' -> TupIDX kenv kenv'
@@ -71,7 +75,7 @@ type family KernelArgs f where
 
 -- Einde elke dag klein taakje voor volgende dag opschrijven
 
-compilePrep ::  UID -> String -> PrepContext env env' -> LLVM PTX (ObjectR (PrepKernel env env'))
+compilePrep ::  UID -> String -> PrepContext env env' -> LLVM PTX (ObjectR (PrepKernel env'))
 compilePrep uid name ss = do
   dev <- asks ptxDeviceProperties
   let uid' = hashIncrement 3 uid
@@ -82,30 +86,34 @@ compilePrep uid name ss = do
 
 prepKernelCodeGen
   :: String
-  -> PrepContext env' f -> LLVM PTX (Module (PrepKernel env f))
+  -> PrepContext env' env -> LLVM PTX (Module (PrepKernel env))
 prepKernelCodeGen name ctx = do
   -- | Refl <- marshalFunResultUnit env = do
   (_, m) <- codeGenKernel name 
-    ( LLVM.Lam kernelDataRawType "in_env"
+    ( LLVM.Lam (PtrPrimType inStructType defaultAddrSpace) "in_env"
     . LLVM.Lam kernelDataRawType "kernel_data"
-    . LLVM.Lam (PtrPrimType structType defaultAddrSpace) "out_env"
+    . LLVM.Lam (PtrPrimType outStructType defaultAddrSpace) "out_env"
     ) (prepKernelCodeGen' ctx)
   return m
   where
     kernelDataRawType :: PrimType (Ptr (SizedArray Word))
     kernelDataRawType = PtrPrimType (ArrayPrimType 0 primType) defaultAddrSpace
-    structType = StructPrimType False $ outEnvStructType (snd ctx)
+    outStructType = StructPrimType False $ outEnvStructType (snd ctx)
+    inStructType = StructPrimType False $ inEnvStructType (snd ctx)
+    
 
 prepKernelCodeGen' 
   :: PrepContext bigEnv f
   -> CodeGen PTX ()
 prepKernelCodeGen' (bigEnv, args) = do
   declareAliasScopes (countMutOuts args)
-  storeKernelArgs bigEnv args operandEnv TupleIdxSelf
+  storeKernelArgs bigEnv args inOperandEnv outOperandEnv TupleIdxSelf TupleIdxSelf
   return_
   where
-    envTp = StructPrimType False (outEnvStructType args)
-    operandEnv = LocalReference (PrimType (PtrPrimType envTp defaultAddrSpace)) "out_env"
+    outEnvTp = StructPrimType False (outEnvStructType args)
+    outOperandEnv = LocalReference (PrimType (PtrPrimType outEnvTp defaultAddrSpace)) "out_env"
+    inEnvTp = StructPrimType False (inEnvStructType args)
+    inOperandEnv = LocalReference (PrimType (PtrPrimType inEnvTp defaultAddrSpace)) "in_env"
 
 
 countMutOuts :: SArgs env f -> Int
@@ -123,22 +131,31 @@ outEnvStructType ArgsNil = TupRunit
 outEnvStructType (SArgScalar (Var tp _) :>: sargs)
   | Refl <- marshalScalarArg tp = TupRsingle (bufferEltR tp) `TupRpair` outEnvStructType sargs
 outEnvStructType (SArgBuffer _ (Var tp _) :>: sargs)
-  = --TupRsingle (PtrPrimType (bufferEltR tp) defaultAddrSpace)
+  =
   TupRsingle (PtrPrimType (bufferEltR tp') defaultAddrSpace) `TupRpair` outEnvStructType sargs
   where
       tp' = case tp of
         GroundRbuffer t -> t
         _ -> internalError "Buffer impossible"
 
+inEnvStructType :: SArgs env f -> TupR PrimType (KernelArgPtrs f)
+inEnvStructType ArgsNil = TupRunit
+inEnvStructType (SArgScalar (Var tp _) :>: sargs)
+  | Refl <- marshalScalarArg tp = TupRsingle (PtrPrimType (bufferEltR tp) defaultAddrSpace) `TupRpair` inEnvStructType sargs
+inEnvStructType (SArgBuffer _ (Var tp _) :>: sargs)
+  =
+  TupRsingle (PtrPrimType (PtrPrimType (bufferEltR tp') defaultAddrSpace) defaultAddrSpace) `TupRpair` inEnvStructType sargs
+  where
+      tp' = case tp of
+        GroundRbuffer t -> t
+        _ -> internalError "Buffer impossible"
 
-storeKernelArgs :: Env GraphEnv env-> SArgs env f -> Operand (Ptr (Struct struct)) -> TupleIdx struct (KernelArgs f) -> CodeGen PTX ()
-storeKernelArgs env (SArgScalar (Var tp idx) :>: sargs) struct structIdx = do
-  -- | Refl <- scalarReprBase tp = do
 
-    -- let ptrToScalar = undefined -- TODO
-    let 
-      ptrToScalar = ConstantOperand $ NullPtrConstant $ PrimType 
-                  $ PtrPrimType (bufferEltR tp) defaultAddrSpace
+storeKernelArgs :: Env GraphEnv env-> SArgs env f -> Operand (Ptr (Struct structIn)) -> Operand (Ptr (Struct structOut)) -> TupleIdx structIn (KernelArgPtrs f) -> TupleIdx structOut (KernelArgs f) -> CodeGen PTX ()
+storeKernelArgs env (SArgScalar (Var tp idx) :>: sargs) inStruct outStruct inStructIdx outStructIdx = do
+
+    ldPtr <- instr' $ GetElementPtr $ gepStruct (PtrPrimType (bufferEltR tp) defaultAddrSpace) inStruct (tupleLeft inStructIdx)
+    ptrToScalar <- instrMD' (Load NonVolatile ldPtr Nothing) (bufferMetadata' Nothing)
 
     -- Load from environment
     value <- case prj' idx env of
@@ -146,23 +163,19 @@ storeKernelArgs env (SArgScalar (Var tp idx) :>: sargs) struct structIdx = do
       _ -> internalError "invalid argument type, expected scalar"
     
     -- Store to struct
-    storePtr <- instr' $ GetElementPtr $ gepStruct (bufferEltR tp) struct (tupleLeft structIdx)
+    storePtr <- instr' $ GetElementPtr $ gepStruct (bufferEltR tp) outStruct (tupleLeft outStructIdx)
     store NonVolatile tp storePtr value Nothing
 
-    storeKernelArgs env sargs struct (tupleRight structIdx)
-storeKernelArgs env (SArgBuffer _ (Var tp idx) :>: sargs) struct structIdx = do
+    storeKernelArgs env sargs inStruct outStruct (tupleRight inStructIdx) (tupleRight outStructIdx)
+storeKernelArgs env (SArgBuffer _ (Var tp idx) :>: sargs) inStruct outStruct inStructIdx outStructIdx = do
     
     let 
       tp' = case tp of
         GroundRbuffer t -> t
         _ -> internalError "Buffer impossible"
 
-    -- let ptrToBuffer = undefined -- TODO
-    let 
-      ptrToBuffer = ConstantOperand $ NullPtrConstant $ PrimType 
-                  $ PtrPrimType 
-                    (PtrPrimType (bufferEltR tp') defaultAddrSpace) 
-                  defaultAddrSpace
+    ldPtr <- instr' $ GetElementPtr $ gepStruct (PtrPrimType (PtrPrimType (bufferEltR tp') defaultAddrSpace) defaultAddrSpace) inStruct (tupleLeft inStructIdx)
+    ptrToBuffer <- instrMD' (Load NonVolatile ldPtr Nothing) (bufferMetadata' Nothing)
 
     -- Load from environment
     value <- case prj' idx env of
@@ -170,47 +183,8 @@ storeKernelArgs env (SArgBuffer _ (Var tp idx) :>: sargs) struct structIdx = do
       _ -> internalError "invalid argument type, expected buffer"
     
     -- Store to struct
-    storePtr <- instr' $ GetElementPtr $ gepStruct (PtrPrimType (bufferEltR tp') defaultAddrSpace) struct (tupleLeft structIdx)
+    storePtr <- instr' $ GetElementPtr $ gepStruct (PtrPrimType (bufferEltR tp') defaultAddrSpace) outStruct (tupleLeft outStructIdx)
     _ <- instr' $ Store NonVolatile storePtr value Nothing
 
-    storeKernelArgs env sargs struct (tupleRight structIdx)
-storeKernelArgs _ ArgsNil _ _ = return ()
-
--- type family ReprBaseR t where
---   ReprBaseR Signal = Word
---   ReprBaseR SignalResolver = Word
---   ReprBaseR (Ref t) = ReprBaseR t
---   ReprBaseR (OutputRef t) = ReprBaseR t
---   ReprBaseR (Buffer t) = Ptr (BufferEltR t)
---   ReprBaseR t = t
-
--- type family ReprBasesR t where
---   ReprBasesR () = ()
---   ReprBasesR (a, b) = (ReprBasesR a, ReprBasesR b)
---   ReprBasesR t = ReprBaseR t
-
--- -- Representation of values when in memory. See the definitions of ReprBaseR
--- -- and BufferEltR for more information
--- type StorageBaseR t = BufferEltR (ReprBaseR t)
--- type StorageBasesR t = BufferEltR (ReprBasesR t)
-
--- scalarReprBase :: ScalarType tp -> (tp, BufferEltR tp) :~: (ReprBaseR tp, StorageBaseR tp)
--- scalarReprBase (VectorScalarType _) = Refl
--- scalarReprBase (SingleScalarType (NumSingleType (IntegralNumType tp))) = case tp of
---   TypeInt    -> Refl
---   TypeInt8   -> Refl
---   TypeInt16  -> Refl
---   TypeInt32  -> Refl
---   TypeInt64  -> Refl
---   TypeWord   -> Refl
---   TypeWord8  -> Refl
---   TypeWord16 -> Refl
---   TypeWord32 -> Refl
---   TypeWord64 -> Refl
--- scalarReprBase (SingleScalarType (NumSingleType (FloatingNumType tp))) = case tp of
---   TypeHalf   -> Refl
---   TypeFloat  -> Refl
---   TypeDouble -> Refl
-
-
-
+    storeKernelArgs env sargs inStruct outStruct (tupleRight inStructIdx) (tupleRight outStructIdx)
+storeKernelArgs _ ArgsNil _ _ _ _ = return ()
