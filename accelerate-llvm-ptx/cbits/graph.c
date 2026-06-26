@@ -15,14 +15,6 @@ do { \
 #endif
 
 
-typedef enum {BUFFER, SCALAR} AllocType;
-
-struct ProgramMemory{
-    CUdeviceptr *allocations;
-    uint32_t *byte_sizes;
-    AllocType *alloc_types; //TODO
-    uint32_t allocation_count;
-};
 
 struct NodeWriteOutputParams{
     void *done_mvar;
@@ -49,35 +41,6 @@ void CUDA_CB node_write_output(void *arguments){
     printf("\nSuccesfully put the mvar");
 }
 
-
-struct KernelStagingNodeParams{
-    struct ProgramMemory *program_memory;
-    struct KernelArguments kernel_args;
-    CUdeviceptr kernel_args_obj; // TODO: voidpointer and fix alignment for different bytesizes
-};
-
-void CUDA_CB kernel_staging_node(void *arguments){
-    struct KernelStagingNodeParams *params = (struct KernelStagingNodeParams *)arguments;
-    CUdeviceptr *arg_obj = malloc(2 * sizeof(CUdeviceptr));
-
-    for (uint32_t i = 0; i < params->kernel_args.argument_count; i++){
-        uint32_t index = params->kernel_args.argument_indeces[i];
-        //Only works for buffers
-        arg_obj[i] = params->program_memory->allocations[index];
-    }
-    cuMemcpyHtoD(params->kernel_args_obj, (void *)arg_obj, sizeof(2 * sizeof(CUdeviceptr)));
-}
-void CUDA_CB kernel_commit_node(void * arguments){
-    struct KernelStagingNodeParams *params = (struct KernelStagingNodeParams *)arguments;
-    CUdeviceptr *arg_obj = malloc(2 * sizeof(CUdeviceptr));
-    cuMemcpyDtoH(arg_obj, params->kernel_args_obj, sizeof(2 * sizeof(CUdeviceptr)));
-
-    for (uint32_t i = 0; i < params->kernel_args.argument_count; i++){
-        uint32_t index = params->kernel_args.argument_indeces[i];
-        //Only works for buffers
-        params->program_memory->allocations[index] = arg_obj[i];
-    }
-}
 
 void run_graph
     ( uint32_t node_count
@@ -182,25 +145,19 @@ void run_graph
     CUdeviceptr *dev_pointers = (CUdeviceptr *)malloc(allocation_count * sizeof(CUdeviceptr));
     for (size_t i = 0; i < allocation_count; i++)
     {
-        printf("\n PreAllocating device pointer %d", i);
+        printf("\n PreAllocating device pointer %ld", i);
         if (mem_types[i] == MEM_BUFFER){
-            printf("\n %d Is a buffer", i);
+            printf("\n %ld Is a buffer", i);
             CUdeviceptr alloc_ptr;
             CU_CHECK(cuMemAlloc(&alloc_ptr, input_bytesizes[i]));
             CUdeviceptr init_dest_ptr = (CUdeviceptr)(mem + mem_offsets[i]);
-            printf("\nMem adress (host): %u", mem);
-            printf("\nMem adress (device): %u", mem_ptr_d);
+            printf("\nMem adress (device): %llu", mem_ptr_d);
             printf("\nOffset: %d", mem_offsets[i]);
-            printf("\nDestination adress: %u", init_dest_ptr);
+            printf("\nDestination adress: %llu", init_dest_ptr);
             dev_pointers[i] = alloc_ptr;
-            CU_CHECK(cuMemcpyHtoD(mem + mem_offsets[i], (void *)&alloc_ptr, sizeof(CUdeviceptr)));
+            CU_CHECK(cuMemcpyHtoD((CUdeviceptr)(mem + mem_offsets[i]), (void *)&alloc_ptr, sizeof(CUdeviceptr)));
         }   
     }
-    struct ProgramMemory program_memory;
-    program_memory.allocation_count = allocation_count;
-    program_memory.allocations = dev_pointers;
-    program_memory.byte_sizes = input_bytesizes;
-
 
 
     printf("\nDone allocating device pointers");
@@ -287,13 +244,13 @@ void run_graph
             for (uint32_t c = 0; c < input_size; c++){
                 printf("%lu", ((uint64_t* )input_data[input_alloc])[c]);
             }
-            printf("\nMem adress: %u", mem_ptr_d);
+            printf("\nMem adress: %llu", mem_ptr_d);
             printf("\nOffset: %d", mem_offsets[input_alloc]);
             CUdeviceptr input_device_dest = (CUdeviceptr)(mem + mem_offsets[input_alloc]);
             if (mem_types[input_alloc] == MEM_BUFFER){
                 input_device_dest = dev_pointers[input_alloc];
             }
-            printf("\nDestination adress: %u", input_device_dest);
+            printf("\nDestination adress: %llu", input_device_dest);
 
             cpy_params_input.srcMemoryType = CU_MEMORYTYPE_HOST;
             cpy_params_input.srcHost = (void *)input_data[input_alloc];
@@ -362,7 +319,9 @@ void run_graph
             CU_CHECK(cuGraphAddEmptyNode(&new_node, graph, dependencies, dependency_count));
             break;
         case NODE_KERNEL: // TODO: Remove placeholder
-            printf("Kernel from %d to %d", content.content.kernel.alloc_1, content.content.kernel.alloc_2);
+            uint32_t k_a1 = content.content.kernel.alloc_1;
+            uint32_t k_a2 = content.content.kernel.alloc_2;
+            printf("Kernel from %d to %d", k_a1, k_a2);
             printf("\nKernel module: %s", content.content.kernel.module_path);
             printf("\nKernel symbol: %s", content.content.kernel.symbol);
             printf("\nKernel prep symbol: %s", content.content.kernel.prep_symbol);
@@ -387,65 +346,25 @@ void run_graph
             kernel_params.gridDimX = kernel_params.gridDimY = kernel_params.gridDimZ = 1;
             kernel_params.ctx = cuContext;
 
-            struct KernelArguments kArgs;
-            kArgs.argument_count = 2;
-            uint32_t kernel_arg_indeces[2] = {content.content.kernel.alloc_1, content.content.kernel.alloc_2};
-            kArgs.argument_indeces;
+            // This would be example contents of the param struct
+            // struct KernelArguments kArgs;
+            // kArgs.argument_count = 2;
+            // uint32_t kernel_arg_indeces[2] = {content.content.kernel.alloc_1, content.content.kernel.alloc_2};
+            // kArgs.argument_indeces = kernel_arg_indeces;
             
             CUdeviceptr npointer; 
-            // CU_CHECK(cuMemAlloc(&npointer, 8));
-            CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
-            CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
-            // struct ST {
-            //     CUdeviceptr outp;
-            //     CUdeviceptr inp;
-            // };
-            // struct ST st;
-            // st.inp = input_ptr;
-            // st.outp = output_ptr;
+            // CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
+            // CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
             CUdeviceptr params_ptr;
-            // CUdeviceptr arr[2] = {output_ptr, input_ptr};
             printf("\nAllocating param struct");
             CU_CHECK(cuMemAlloc(&params_ptr, 2 * sizeof(CUdeviceptr))); //acquire actual bytesize of argument struct
-            // CU_CHECK(cuMemAlloc(&params_ptr, sizeof(arr)));
-            // CU_CHECK(cuMemAlloc(&params_ptr, sizeof(struct ST)));
-
-            printf("\nCopying param struct to device");
-            // CU_CHECK(cuMemcpyHtoD(params_ptr, (void *)arr, sizeof(arr)));
-            // CU_CHECK(cuMemcpyHtoD(params_ptr, (void *)&st, sizeof(struct ST)));
-
+ 
             void *args[] = {&npointer, &params_ptr};
             // void *args[] = {&npointer, &input_ptr, &output_ptr};
             kernel_params.kernelParams = args;
             kernel_params.func = kernel_func;
-            // kernel_params.func = fs[0];
 
-
-            CUDA_HOST_NODE_PARAMS commit_node_params;
-            memset(&commit_node_params, 0, sizeof(commit_node_params));
-
-            CUDA_HOST_NODE_PARAMS staging_node_params;
-            memset(&staging_node_params, 0, sizeof(staging_node_params));
-
-
-            struct KernelStagingNodeParams commit_params;
-            commit_params.program_memory = &program_memory;
-            commit_params.kernel_args_obj = params_ptr;
-            commit_params.kernel_args = kArgs;
-
-            commit_node_params.userData = (void *)(&commit_params);
-            commit_node_params.fn = kernel_commit_node;
-
-            staging_node_params.userData = (void *)(&commit_params);
-            staging_node_params.fn = kernel_commit_node;
-
-            CUgraphNode staging_node;
-            CU_CHECK(cuGraphAddHostNode(&staging_node, graph, dependencies, dependency_count, &staging_node_params));
-
-            CUgraphNode kernel_node;
-            CU_CHECK(cuGraphAddKernelNode(&kernel_node, graph, &staging_node, 1, &kernel_params));
-
-            CU_CHECK(cuGraphAddHostNode(&new_node, graph, &kernel_node, 1, &commit_node_params));
+            CU_CHECK(cuGraphAddKernelNode(&new_node, graph, dependencies, dependency_count, &kernel_params));
             break;
         default:
             break;
