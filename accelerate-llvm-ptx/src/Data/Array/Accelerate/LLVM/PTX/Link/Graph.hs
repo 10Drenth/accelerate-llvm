@@ -67,6 +67,7 @@ data KernelNodeContents = KernelNodeContents
   , writeAdresses :: [MIdx]
   , modulePath :: FilePath
   , kernelName :: ShortByteString
+  , prepModulePath :: FilePath
   , prepKernelName :: ShortByteString
   }
   deriving (Show)
@@ -87,7 +88,7 @@ data NContent = CopyNode [NIndex] -- Dependencies
 
 instance Storable NContent where
   alignment = const 8
-  sizeOf = const 40
+  sizeOf = const 48
   peek = error "Not implemented"
   poke ptr n = do
     pokeByteOff ptr 0 (cnodeType n)
@@ -110,7 +111,7 @@ instance Storable NContent where
 
 instance Storable KernelNodeContents where
   alignment = const 8
-  sizeOf = const 32
+  sizeOf = const 40
   peek = error "Not implemented"
   poke ptr contents = useAsCString (kernelName contents) $ \symbolC ->
     useAsCString (prepKernelName contents) $ \symbolPrepC -> do
@@ -119,7 +120,9 @@ instance Storable KernelNodeContents where
         p <- newCString $ modulePath contents
         pokeByteOff ptr 8 p
         pokeByteOff ptr 16 symbolC
-        pokeByteOff ptr 24 symbolPrepC
+        pp <- newCString $ prepModulePath contents
+        pokeByteOff ptr 24 pp
+        pokeByteOff ptr 32 symbolPrepC
         where
           r = head $ readAdresses contents
           w = head $ writeAdresses contents
@@ -258,7 +261,7 @@ convertBody s@(ConvState {..}) env schedule prev = let
       -- prepObj = undefined
       -- TODO: Get proper in and out adresses
       -- 
-      content = trace (objPath prepObj) $ KernelNodeContents [MIdx 0] [MIdx 1] (objPath obj) (objSym obj) (objSym prepObj)
+      content = trace (objPath prepObj) $ KernelNodeContents [MIdx 0] [MIdx 1] (objPath obj) (objSym obj) (objPath prepObj) (objSym prepObj)
 
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
       -- Dependency sets link from first input to first output

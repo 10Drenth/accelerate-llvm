@@ -50,7 +50,7 @@ import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch
 
 type PrepEnv env = Ptr (Struct (KernelArgPtrs env))
 
-type PrepKernel env = PrepEnv env -> Ptr (SizedArray Word) -> Ptr (Struct (KernelArgs env)) -> ()
+type PrepKernel env = PrepEnv env -> Ptr (Struct (KernelArgs env)) -> ()
 
 type PrepContext env f = (Env GraphEnv env, SArgs env f)
 
@@ -91,13 +91,10 @@ prepKernelCodeGen name ctx = do
   -- | Refl <- marshalFunResultUnit env = do
   (_, m) <- codeGenKernel name 
     ( LLVM.Lam (PtrPrimType inStructType defaultAddrSpace) "in_env"
-    . LLVM.Lam kernelDataRawType "kernel_data"
     . LLVM.Lam (PtrPrimType outStructType defaultAddrSpace) "out_env"
     ) (prepKernelCodeGen' ctx)
   return m
   where
-    kernelDataRawType :: PrimType (Ptr (SizedArray Word))
-    kernelDataRawType = PtrPrimType (ArrayPrimType 0 primType) defaultAddrSpace
     outStructType = StructPrimType False $ outEnvStructType (snd ctx)
     inStructType = StructPrimType False $ inEnvStructType (snd ctx)
     

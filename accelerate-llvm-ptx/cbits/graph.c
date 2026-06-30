@@ -204,7 +204,6 @@ void run_graph
         switch (content.node_type)
         {
         case NODE_COPY:
-            // TODO: Handle Scalar and Buffer copies separately
             CUDA_MEMCPY3D cpy_params_cpy;
             uint32_t cp_id1 = content.content.general.alloc_1;
             uint32_t cp_id2 = content.content.general.alloc_2;
@@ -324,47 +323,62 @@ void run_graph
             printf("Kernel from %d to %d", k_a1, k_a2);
             printf("\nKernel module: %s", content.content.kernel.module_path);
             printf("\nKernel symbol: %s", content.content.kernel.symbol);
+            printf("\nKernel prep module: %s", content.content.kernel.prep_module_path);
             printf("\nKernel prep symbol: %s", content.content.kernel.prep_symbol);
             
-            CUmodule mod;
-            printf("\nLoading module");
+            CUmodule mod, prep_mod;
+            printf("\nLoading modules");
             CU_CHECK(cuModuleLoad(&mod, content.content.kernel.module_path));
+            CU_CHECK(cuModuleLoad(&prep_mod, content.content.kernel.prep_module_path));
 
-            printf("\nGetting Function");
-            CUfunction kernel_func;
+            printf("\nGetting Functions");
+            CUfunction kernel_func, prep_kernel_func;
             CU_CHECK(cuModuleGetFunction(&kernel_func, mod, content.content.kernel.symbol));
-            printf("\nSetting up parameters");
-            size_t poffset;
-            size_t psize;
-            CU_CHECK(cuFuncGetParamInfo(kernel_func, 0, &poffset, &psize));
-            CU_CHECK(cuFuncGetParamInfo(kernel_func, 1, &poffset, &psize));
-            printf("\nDone getting param info");
+            CU_CHECK(cuModuleGetFunction(&prep_kernel_func, prep_mod, content.content.kernel.prep_symbol));
+
+            // printf("\nSetting up parameters");
+            // size_t poffset;
+            // size_t psize;
+            // CU_CHECK(cuFuncGetParamInfo(kernel_func, 0, &poffset, &psize));
+            // CU_CHECK(cuFuncGetParamInfo(kernel_func, 1, &poffset, &psize));
+            // printf("\nDone getting param info");
             
+            CUDA_KERNEL_NODE_PARAMS prep_kernel_params;
             CUDA_KERNEL_NODE_PARAMS kernel_params;
             memset(&kernel_params, 0, sizeof(kernel_params));
+            memset(&prep_kernel_params, 0, sizeof(prep_kernel_params));
             kernel_params.blockDimX = kernel_params.blockDimY = kernel_params.blockDimZ = 1;
+            prep_kernel_params.blockDimX = prep_kernel_params.blockDimY = prep_kernel_params.blockDimZ = 1;
             kernel_params.gridDimX = kernel_params.gridDimY = kernel_params.gridDimZ = 1;
-            kernel_params.ctx = cuContext;
-
-            // This would be example contents of the param struct
-            // struct KernelArguments kArgs;
-            // kArgs.argument_count = 2;
-            // uint32_t kernel_arg_indeces[2] = {content.content.kernel.alloc_1, content.content.kernel.alloc_2};
-            // kArgs.argument_indeces = kernel_arg_indeces;
+            prep_kernel_params.gridDimX = prep_kernel_params.gridDimY = prep_kernel_params.gridDimZ = 1;
+            kernel_params.ctx = prep_kernel_params.ctx = cuContext;
             
             CUdeviceptr npointer; 
             // CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
             // CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
+            CUdeviceptr params_idxs_ptr;
+            printf("\nAllocating input param struct");
+            CU_CHECK(cuMemAlloc(&params_idxs_ptr, 2 * sizeof(CUdeviceptr))); //acquire actual bytesize of argument struct
+            CUdeviceptr params_idxs[2] =    { (CUdeviceptr)(mem + mem_offsets[k_a2])
+                                            , (CUdeviceptr)(mem + mem_offsets[k_a1])
+                                            };
+            CU_CHECK(cuMemcpyHtoD(params_idxs_ptr, params_idxs, 2 * sizeof(CUdeviceptr)));
             CUdeviceptr params_ptr;
-            printf("\nAllocating param struct");
-            CU_CHECK(cuMemAlloc(&params_ptr, 2 * sizeof(CUdeviceptr))); //acquire actual bytesize of argument struct
- 
-            void *args[] = {&npointer, &params_ptr};
-            // void *args[] = {&npointer, &input_ptr, &output_ptr};
-            kernel_params.kernelParams = args;
-            kernel_params.func = kernel_func;
+            CU_CHECK(cuMemAlloc(&params_ptr, input_bytesizes[k_a1] + input_bytesizes[k_a2]));
 
-            CU_CHECK(cuGraphAddKernelNode(&new_node, graph, dependencies, dependency_count, &kernel_params));
+            void *args[] = {&npointer, &params_ptr};
+            void *prep_args[] = {&params_idxs_ptr, &params_ptr};
+
+            kernel_params.kernelParams = args;
+            prep_kernel_params.kernelParams = prep_args;
+            kernel_params.func = kernel_func;
+            prep_kernel_params.func = prep_kernel_func;
+            
+            CUgraphNode prep_node;
+
+            CU_CHECK(cuGraphAddKernelNode(&prep_node, graph, dependencies, dependency_count, &prep_kernel_params));
+
+            CU_CHECK(cuGraphAddKernelNode(&new_node, graph, &prep_node, 1, &kernel_params));
             break;
         default:
             break;
