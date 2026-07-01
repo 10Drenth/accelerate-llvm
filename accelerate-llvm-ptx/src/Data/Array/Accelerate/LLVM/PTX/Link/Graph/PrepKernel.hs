@@ -38,7 +38,6 @@ import Data.Array.Accelerate.AST.Environment
 import Data.Array.Accelerate.LLVM.CodeGen.Array
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Representation.Shape
-import LLVM.AST.Type.Constant (Constant(NullPtrConstant))
 import Data.Array.Accelerate.LLVM.PTX.Compile.Cache
 import Data.Array.Accelerate.LLVM.PTX.Compile
 import Control.Monad.Reader
@@ -88,7 +87,6 @@ prepKernelCodeGen
   :: String
   -> PrepContext env' env -> LLVM PTX (Module (PrepKernel env))
 prepKernelCodeGen name ctx = do
-  -- | Refl <- marshalFunResultUnit env = do
   (_, m) <- codeGenKernel name 
     ( LLVM.Lam (PtrPrimType inStructType defaultAddrSpace) "in_env"
     . LLVM.Lam (PtrPrimType outStructType defaultAddrSpace) "out_env"

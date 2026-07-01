@@ -14,13 +14,13 @@ struct NodeContent {
     int8_t node_type; // Size 1, alignment 1
     union {
         struct {
-            uint32_t alloc_1; // Size 4, alignment 4
-            uint32_t alloc_2; // Size 4, alignment 4
-            char* module_path; // Size 8, alignment 8
-            char* symbol; // Size 8, alignment 8
-            char* prep_module_path; // Size 8, aligment 8
-            char* prep_symbol; // Size 8, alignment 8
-        } kernel; // Size 40, alignment 8
+            uint32_t arg_count; // Size 8, alignment 8
+            uint32_t *arg_indices; // Size 8, alignment 8
+            char *module_path; // Size 8, alignment 8
+            char *symbol; // Size 8, alignment 8
+            char *prep_module_path; // Size 8, aligment 8
+            char *prep_symbol; // Size 8, alignment 8
+        } kernel; // Size 48, alignment 8
         struct {
             uint32_t alloc_1;
             uint32_t alloc_2;
@@ -30,7 +30,7 @@ struct NodeContent {
             uint32_t alloc_2;
         } general; // Size 8, alignment 8
     } content; // Size 40, alignment 8
-}; // Size 48, alignment 8
+}; // Size 56, alignment 8
 
 struct GraphProgram {
     // Graph definition

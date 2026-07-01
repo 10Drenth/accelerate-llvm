@@ -318,9 +318,9 @@ void run_graph
             CU_CHECK(cuGraphAddEmptyNode(&new_node, graph, dependencies, dependency_count));
             break;
         case NODE_KERNEL: // TODO: Remove placeholder
-            uint32_t k_a1 = content.content.kernel.alloc_1;
-            uint32_t k_a2 = content.content.kernel.alloc_2;
-            printf("Kernel from %d to %d", k_a1, k_a2);
+            uint32_t k_arg_count = content.content.kernel.arg_count;
+            uint32_t *k_arg_indeces = content.content.kernel.arg_indices;
+            // printf("Kernel from %d to %d", k_a1, k_a2);
             printf("\nKernel module: %s", content.content.kernel.module_path);
             printf("\nKernel symbol: %s", content.content.kernel.symbol);
             printf("\nKernel prep module: %s", content.content.kernel.prep_module_path);
@@ -353,21 +353,28 @@ void run_graph
             prep_kernel_params.gridDimX = prep_kernel_params.gridDimY = prep_kernel_params.gridDimZ = 1;
             kernel_params.ctx = prep_kernel_params.ctx = cuContext;
             
-            CUdeviceptr npointer; 
-            // CUdeviceptr input_ptr = dev_pointers[content.content.kernel.alloc_1];
-            // CUdeviceptr output_ptr = dev_pointers[content.content.kernel.alloc_2];
-            CUdeviceptr params_idxs_ptr;
             printf("\nAllocating input param struct");
-            CU_CHECK(cuMemAlloc(&params_idxs_ptr, 2 * sizeof(CUdeviceptr))); //acquire actual bytesize of argument struct
-            CUdeviceptr params_idxs[2] =    { (CUdeviceptr)(mem + mem_offsets[k_a2])
-                                            , (CUdeviceptr)(mem + mem_offsets[k_a1])
-                                            };
-            CU_CHECK(cuMemcpyHtoD(params_idxs_ptr, params_idxs, 2 * sizeof(CUdeviceptr)));
+            size_t params_ptr_struct_size = k_arg_count * sizeof(CUdeviceptr);
+            CUdeviceptr params_idxs_d;
+            CU_CHECK(cuMemAlloc(&params_idxs_d, params_ptr_struct_size));
+            CUdeviceptr *params_idxs_h = malloc(params_ptr_struct_size);
+            
+            size_t params_struct_size = 0;
+            for (size_t a_idx = 0; a_idx < k_arg_count; a_idx++)
+            {   // This should account for alignment
+                size_t a_idxx = a_idx;
+                // size_t a_idxx = k_arg_count - a_idx - 1;
+                params_struct_size += input_bytesizes[a_idxx];
+                params_idxs_h[a_idx] = (CUdeviceptr)(mem + mem_offsets[k_arg_indeces[a_idxx]]);
+            }
+            CU_CHECK(cuMemcpyHtoD(params_idxs_d, params_idxs_h, params_ptr_struct_size));
+            
             CUdeviceptr params_ptr;
-            CU_CHECK(cuMemAlloc(&params_ptr, input_bytesizes[k_a1] + input_bytesizes[k_a2]));
-
+            CU_CHECK(cuMemAlloc(&params_ptr, params_struct_size));
+            
+            CUdeviceptr npointer; 
             void *args[] = {&npointer, &params_ptr};
-            void *prep_args[] = {&params_idxs_ptr, &params_ptr};
+            void *prep_args[] = {&params_idxs_d, &params_ptr};
 
             kernel_params.kernelParams = args;
             prep_kernel_params.kernelParams = prep_args;

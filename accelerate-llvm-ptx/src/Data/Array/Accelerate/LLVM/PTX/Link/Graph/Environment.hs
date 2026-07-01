@@ -3,7 +3,7 @@
 
 
 module Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment 
-(memoryOffsets, memoryTypes, reserveMemory, envMemKey, reserveGround, GraphEnv (..), EventIndex (..), GMEntry (..), MIdx (..), GraphMemory, MEntryType (..))
+(memoryOffsets, memoryTypes, reserveMemory, envMemKey, reserveGround, prjKernelArgs, propRef, GraphEnv (..), EventIndex (..), GMEntry (..), MIdx (..), GraphMemory, MEntryType (..))
  where
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.Array.Buffer
@@ -14,6 +14,8 @@ import LLVM.AST.Type.Representation (makeAligned)
 import qualified Data.Map as M
 import Data.Array.Accelerate.Representation.Elt
 import Foreign
+import Data.Array.Accelerate.AST.Environment
+import Data.Maybe (maybeToList)
 
 data GraphEnv t where
   ScalarVal :: MIdx -> !(ScalarType t) -> GraphEnv t
@@ -61,6 +63,11 @@ memoryTypes (_, m) = let n = M.size m in
   | i <- [0..(n-1)]
   ]
 
+prjKernelArgs :: SArgs env f -> Env GraphEnv env -> [MIdx]
+prjKernelArgs ArgsNil _ = []
+prjKernelArgs (SArgScalar (Var _ idx) :>: sargs) env = maybeToList (envMemKey (prj' idx env)) ++ prjKernelArgs sargs env
+prjKernelArgs (SArgBuffer _ (Var _ idx) :>: sargs) env = maybeToList (envMemKey (prj' idx env)) ++ prjKernelArgs sargs env
+
 reserveMemory :: MEntryType -> Int -> Int -> GraphMemory -> (GraphMemory, MIdx)
 reserveMemory tp byteSize al (cursor, xs) = let 
     cursor' = makeAligned cursor al
@@ -79,6 +86,13 @@ reserveGround (GroundRscalar tp) mem = let
 reserveGround (GroundRbuffer _) mem = let 
   (m, k) = reserveMemory MBuffer (sizeOf (0 :: Int)) (sizeOf (0 :: Int)) mem
    in (BufferVal k, m, k)
+
+propRef :: MIdx -> MIdx -> GraphMemory -> Maybe GraphMemory
+propRef rIdx wIdx (cursor, xs) = do
+  v <- xs M.!? rIdx
+  -- TODO: Check values are the same size
+  let xs' = M.insert wIdx v xs
+  return (cursor, xs')
 
 newtype EventIndex = EventIndex Int
   deriving (Eq, Ord, Show)

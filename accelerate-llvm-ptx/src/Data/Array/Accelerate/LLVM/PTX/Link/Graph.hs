@@ -26,7 +26,7 @@ import Data.IORef (readIORef, IORef, writeIORef)
 import Data.Array.Accelerate.Representation.Elt (showElt, scalarTypeSize)
 import Data.Array.Accelerate.Array.Buffer (bufferToList, Buffer (Buffer), memoryByteSize, MutableBuffer (..), newBuffer, writeBuffer, indexBuffer)
 import Foreign
-import Data.Maybe (mapMaybe, maybeToList)
+import Data.Maybe (mapMaybe, maybeToList, fromJust)
 import Data.Bifunctor
 import GHC.Conc (PrimMVar, newStablePtrPrimMVar)
 import Control.Concurrent.MVar (newEmptyMVar, MVar)
@@ -61,10 +61,12 @@ data EventContents = EventContents [NIndex] -- Incoming
 
 type Events = M.Map EventIndex EventContents
 
+-- Might need to store modifier here at some point (Read, Write, Mut)
+newtype KernelNodeArg = KernelNodeArg MIdx
+  deriving (Show)
 
 data KernelNodeContents = KernelNodeContents
-  { readAdresses :: [MIdx]
-  , writeAdresses :: [MIdx]
+  { kernelArgs :: [KernelNodeArg]
   , modulePath :: FilePath
   , kernelName :: ShortByteString
   , prepModulePath :: FilePath
@@ -86,9 +88,15 @@ data NContent = CopyNode [NIndex] -- Dependencies
                               KernelNodeContents
   deriving (Show)
 
+instance Storable KernelNodeArg where
+  sizeOf (KernelNodeArg idx) = sizeOf idx
+  alignment (KernelNodeArg idx) = alignment idx
+  peek ptr = KernelNodeArg <$> peek (castPtr ptr) 
+  poke ptr (KernelNodeArg idx) = poke (castPtr ptr) idx
+
 instance Storable NContent where
   alignment = const 8
-  sizeOf = const 48
+  sizeOf = const 56
   peek = error "Not implemented"
   poke ptr n = do
     pokeByteOff ptr 0 (cnodeType n)
@@ -111,21 +119,25 @@ instance Storable NContent where
 
 instance Storable KernelNodeContents where
   alignment = const 8
-  sizeOf = const 40
+  sizeOf = const 48
   peek = error "Not implemented"
   poke ptr contents = useAsCString (kernelName contents) $ \symbolC ->
     useAsCString (prepKernelName contents) $ \symbolPrepC -> do
-        pokeByteOff ptr 0 r
-        pokeByteOff ptr 4 w
-        p <- newCString $ modulePath contents
-        pokeByteOff ptr 8 p
-        pokeByteOff ptr 16 symbolC
-        pp <- newCString $ prepModulePath contents
-        pokeByteOff ptr 24 pp
-        pokeByteOff ptr 32 symbolPrepC
-        where
-          r = head $ readAdresses contents
-          w = head $ writeAdresses contents
+        argsFP <- mallocForeignPtrArray argCount
+        withForeignPtr argsFP $ \argsPtr -> do
+          pokeArray argsPtr $ kernelArgs contents
+          pokeByteOff ptr 0 (fromIntegral argCount :: Word32)
+          pokeByteOff ptr 8 argsPtr
+          p <- newCString $ modulePath contents
+          pokeByteOff ptr 16 p
+          pokeByteOff ptr 24 symbolC
+          pp <- newCString $ prepModulePath contents
+          pokeByteOff ptr 32 pp
+          pokeByteOff ptr 40 symbolPrepC
+    where
+      argCount = length $ kernelArgs contents
+
+        
 
 cnodeType :: NContent -> Int8
 cnodeType (CopyNode {}) = 0
@@ -186,7 +198,6 @@ convertBody :: ConvState -> Env GraphEnv env -> UniformSchedule PTXKernel env ->
 convertBody s@(ConvState {..}) env schedule prev = let
   nodeIdx = NodeIndex $ M.size nodes
   eventIdx = EventIndex $ M.size events
-  -- memIdx = AIndex (M.size memDeps) 0
   in case schedule of
 
   Return -> s
@@ -249,19 +260,28 @@ convertBody s@(ConvState {..}) env schedule prev = let
           env' = push' env (lhs, rval)
           in convertBody s env' next prev
       _ -> error "RefRead invalid value"
-  (Effect (RefWrite _ _) next) -> let
-    in convertBody s env next prev
-  (Effect (Exec metaData fun args) next) -> case kernelFunKernel fun of
+  (Effect (RefWrite rVar vVar) next)
+    | OutRefVal outVar <- prj' (varIdx rVar) env
+    , inVar <- prj' (varIdx vVar) env
+    , Refl <- reprIsSingle @GraphEnv @_ @GraphEnv inVar -> let
+    mem' = case do
+      outIdx <- envMemKey outVar
+      inIdx <- envMemKey inVar
+      propRef inIdx outIdx mem of
+        Just x -> x
+        Nothing -> internalError "RefWrite invalid target"
+    in convertBody s { mem = mem'} env next prev
+    | otherwise -> internalError "RefWrite invalid value"
+  (Effect (Exec _ fun args) next) -> case kernelFunKernel fun of
     (Exists (PTXKernel {kernelMain, kernelPrepGen})) -> let
       obj = kernelPhaseObject kernelMain
 
       -- prepCodeGen = prepKernelCodeGen env args undefined
       --prepMod = _
       prepObj = unsafePerformIO $ evalPTX defaultTarget $ compilePrep (snd kernelPrepGen) (fst kernelPrepGen) (env, args)
-      -- prepObj = undefined
-      -- TODO: Get proper in and out adresses
-      -- 
-      content = trace (objPath prepObj) $ KernelNodeContents [MIdx 0] [MIdx 1] (objPath obj) (objSym obj) (objPath prepObj) (objSym prepObj)
+
+      argList = KernelNodeArg <$> prjKernelArgs args env 
+      content = trace (show argList) $ trace (objPath prepObj) $ KernelNodeContents argList (objPath obj) (objSym obj) (objPath prepObj) (objSym prepObj)
 
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
       -- Dependency sets link from first input to first output
