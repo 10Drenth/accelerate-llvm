@@ -42,6 +42,7 @@ import Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel (compilePrep)
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node.Kernel
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Marshal (MStorable(MStorable), WStorable (..))
+import Data.Array.Accelerate.Lifetime
 
 
 
@@ -167,18 +168,8 @@ convertBody s@(ConvState {..}) env schedule prev = let
     in convertBody s { mem = mem'} env next prev
     | otherwise -> internalError "RefWrite invalid value"
   (Effect (Exec _ fun args) next) -> case kernelFunKernel fun of
-    (Exists (PTXKernel {kernelMain, kernelPrepGen})) -> let
-      obj = kernelPhaseObject kernelMain
-
-      -- prepCodeGen = prepKernelCodeGen env args undefined
-      --prepMod = _
-      prepObj = unsafePerformIO $ evalPTX defaultTarget $ compilePrep (snd kernelPrepGen) (fst kernelPrepGen) (env, args)
-
-      argList = KernelNodeArg <$> prjKernelArgs args env 
-      content = trace (show argList) $ trace (objPath prepObj) $ KernelNodeContents 
-        argList 
-        (KernelPhase (objPath obj) (objSym obj)) 
-        (KernelPhase (objPath prepObj) (objSym prepObj))
+    (Exists kernel) -> let
+      content = fromPTXKernel env kernel args
 
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
       -- Dependency sets link from first input to first output

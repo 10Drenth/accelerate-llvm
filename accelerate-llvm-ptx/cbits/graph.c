@@ -63,7 +63,8 @@ void run_graph
     printf("\nSome nodecontent info: size %lu, alignment: %lu\n", sizeof(struct NodeContent), _Alignof(struct NodeContent));
     printf("\nSome content content info: size %lu, alignment: %lu\n", sizeof(node_contents[0].content), _Alignof(sizeof(node_contents[0].content)));
     printf("\nSome kernel content info: size %lu, alignment: %lu\n", sizeof(node_contents[0].content.kernel), _Alignof(sizeof(node_contents[0].content.kernel)));
-    
+    printf("\nSome kernelphase info: size %lu, alignment: %lu\n", sizeof(struct KernelPhase), _Alignof(struct KernelPhase));
+
     printf("\nSome mem info: total size: %d, devpointer alignment: %lu \n", mem_bytesize, _Alignof(CUdeviceptr));
 
 
@@ -318,27 +319,30 @@ void run_graph
             CU_CHECK(cuGraphAddEmptyNode(&new_node, graph, dependencies, dependency_count));
             break;
         case NODE_KERNEL: // TODO: Remove placeholder
+
             uint32_t k_arg_count = content.content.kernel.arg_count;
             uint32_t *k_arg_indeces = content.content.kernel.arg_indices;
             // printf("Kernel from %d to %d", k_a1, k_a2);
-            printf("\nKernel module: %s", content.content.kernel.module_path);
-            printf("\nKernel symbol: %s", content.content.kernel.symbol);
-            printf("\nKernel prep module: %s", content.content.kernel.prep_module_path);
-            printf("\nKernel prep symbol: %s", content.content.kernel.prep_symbol);
             printf("\nIterating over %d parameters: ", k_arg_count);
             for (size_t a_idx = 0; a_idx < k_arg_count; a_idx++){
                 printf("%d, ", k_arg_indeces[a_idx]);
             }
+            printf("\n check");
+            printf("\nKernel module: %s", content.content.kernel.main_phase.module_path);
+            printf("\nKernel symbol: %s", content.content.kernel.main_phase.symbol);
+            printf("\nKernel prep module: %s", content.content.kernel.prep_phase.module_path);
+            printf("\nKernel prep symbol: %s", content.content.kernel.prep_phase.symbol);
+            
             
             CUmodule mod, prep_mod;
             printf("\nLoading modules");
-            CU_CHECK(cuModuleLoad(&mod, content.content.kernel.module_path));
-            CU_CHECK(cuModuleLoad(&prep_mod, content.content.kernel.prep_module_path));
+            CU_CHECK(cuModuleLoad(&mod, content.content.kernel.main_phase.module_path));
+            CU_CHECK(cuModuleLoad(&prep_mod, content.content.kernel.prep_phase.module_path));
 
             printf("\nGetting Functions");
             CUfunction kernel_func, prep_kernel_func;
-            CU_CHECK(cuModuleGetFunction(&kernel_func, mod, content.content.kernel.symbol));
-            CU_CHECK(cuModuleGetFunction(&prep_kernel_func, prep_mod, content.content.kernel.prep_symbol));
+            CU_CHECK(cuModuleGetFunction(&kernel_func, mod, content.content.kernel.main_phase.symbol));
+            CU_CHECK(cuModuleGetFunction(&prep_kernel_func, prep_mod, content.content.kernel.prep_phase.symbol));
 
             // printf("\nSetting up parameters");
             // size_t poffset;

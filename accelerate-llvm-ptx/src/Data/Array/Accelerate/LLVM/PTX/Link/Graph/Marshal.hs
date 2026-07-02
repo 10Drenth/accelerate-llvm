@@ -48,7 +48,7 @@ instance MarshalToC a => MarshalToC (Marshal [a]) where
             poke (castPtr ptr) xsPtr
 
 instance (MarshalToC a, MarshalToC b) => MarshalToC (Marshal (a, b)) where
-    marshalSize (Marshal (x, y)) = makeAligned (marshalSize x) (marshalAlignment y) + marshalSize y
+    marshalSize v@(Marshal (x, y)) = makeAligned (makeAligned (marshalSize x) (marshalAlignment y) + marshalSize y) (marshalAlignment v)
     marshalAlignment (Marshal (x, y)) = max (marshalAlignment x) (marshalAlignment y)
     marshalWrite ptr (Marshal (x, y)) = do
         let xPtr = castPtr $ alignPtr ptr (marshalAlignment x) 

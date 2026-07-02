@@ -5,10 +5,18 @@
 #include <stdbool.h>
 
 struct NodeContent;
+struct KernelPhase;
 struct GraphProgram;
 typedef enum {NODE_COPY, NODE_INPUT, NODE_OUTPUT, NODE_EMPTY, NODE_ALLOC, NODE_KERNEL} NodeType;
 typedef enum {MEM_SCALAR, MEM_BUFFER} MemType;
 
+struct KernelPhase {
+    char *module_path; // Size 8, alignment 8
+    char *symbol; // Size 8, alignment 8
+    int32_t thread_block_size;
+    int32_t grid_size;
+    int32_t shared_memory_bytes;
+};
 
 struct NodeContent {
     int32_t node_type; // Size 1, alignment 1
@@ -16,10 +24,8 @@ struct NodeContent {
         struct {
             uint32_t arg_count; // Size 4, alignment 4
             uint32_t *arg_indices; // Size 4, alignment 4
-            char *module_path; // Size 8, alignment 8
-            char *symbol; // Size 8, alignment 8
-            char *prep_module_path; // Size 8, aligment 8
-            char *prep_symbol; // Size 8, alignment 8
+            struct KernelPhase main_phase;
+            struct KernelPhase prep_phase;
         } kernel; // Size 48, alignment 8
         struct {
             uint32_t alloc_1;
@@ -31,6 +37,7 @@ struct NodeContent {
         } general; // Size 8, alignment 8
     } content; // Size 40, alignment 8
 }; // Size 56, alignment 8
+
 
 struct GraphProgram {
     // Graph definition
