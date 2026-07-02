@@ -325,6 +325,10 @@ void run_graph
             printf("\nKernel symbol: %s", content.content.kernel.symbol);
             printf("\nKernel prep module: %s", content.content.kernel.prep_module_path);
             printf("\nKernel prep symbol: %s", content.content.kernel.prep_symbol);
+            printf("\nIterating over %d parameters: ", k_arg_count);
+            for (size_t a_idx = 0; a_idx < k_arg_count; a_idx++){
+                printf("%d, ", k_arg_indeces[a_idx]);
+            }
             
             CUmodule mod, prep_mod;
             printf("\nLoading modules");
@@ -360,6 +364,7 @@ void run_graph
             CUdeviceptr *params_idxs_h = malloc(params_ptr_struct_size);
             
             size_t params_struct_size = 0;
+            
             for (size_t a_idx = 0; a_idx < k_arg_count; a_idx++)
             {   // This should account for alignment
                 size_t a_idxx = a_idx;

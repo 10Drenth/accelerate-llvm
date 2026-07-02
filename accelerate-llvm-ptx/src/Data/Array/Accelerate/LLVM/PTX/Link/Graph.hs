@@ -26,30 +26,26 @@ import Data.IORef (readIORef, IORef, writeIORef)
 import Data.Array.Accelerate.Representation.Elt (showElt, scalarTypeSize)
 import Data.Array.Accelerate.Array.Buffer (bufferToList, Buffer (Buffer), memoryByteSize, MutableBuffer (..), newBuffer, writeBuffer, indexBuffer)
 import Foreign
-import Data.Maybe (mapMaybe, maybeToList, fromJust)
+import Data.Maybe (mapMaybe, maybeToList)
 import Data.Bifunctor
 import GHC.Conc (PrimMVar, newStablePtrPrimMVar)
 import Control.Concurrent.MVar (newEmptyMVar, MVar)
 import Data.Array.Accelerate.AST.Kernel (kernelFunKernel)
-import Data.ByteString.Short (ShortByteString, useAsCString)
 import Debug.Trace (trace)
-import Foreign.C (newCString)
 import Data.Type.Equality (type (:~:)(Refl))
-import Data.Array.Accelerate.LLVM.PTX.Target
-import Data.Array.Accelerate.LLVM.CodeGen.Monad (CodeGen)
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.LLVM.PTX.Compile
 import GHC.IO (unsafePerformIO)
 import Data.Array.Accelerate.LLVM.PTX.State (evalPTX, defaultTarget)
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel (compilePrep)
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node.Kernel
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Marshal (MStorable(MStorable), WStorable (..))
 
 
 
 data GraphProgram = GraphProgram Nodes MemoryMap GraphMemory
-
-newtype NIndex = NodeIndex Int
-  deriving (Eq, Ord)
 
 
 type Nodes = M.Map NIndex NContent
@@ -61,108 +57,6 @@ data EventContents = EventContents [NIndex] -- Incoming
 
 type Events = M.Map EventIndex EventContents
 
--- Might need to store modifier here at some point (Read, Write, Mut)
-newtype KernelNodeArg = KernelNodeArg MIdx
-  deriving (Show)
-
-data KernelNodeContents = KernelNodeContents
-  { kernelArgs :: [KernelNodeArg]
-  , modulePath :: FilePath
-  , kernelName :: ShortByteString
-  , prepModulePath :: FilePath
-  , prepKernelName :: ShortByteString
-  }
-  deriving (Show)
-
-data NContent = CopyNode [NIndex] -- Dependencies
-                            MIdx -- From
-                            MIdx -- To
-                 | Input MIdx
-                 | Output MIdx [NIndex] -- Dependencies
-                 | EmptyNode [NIndex] -- Dependencies
-                --  | AllocNode AIndex -- Target adress
-                --              Int -- Element bytesize TODO: Implement (for now ignored)
-                --              [AIndex] -- dims TODO: Implement (for now ignored)
-                --              [NIndex] -- Dependencies 
-                 | KernelNode [NIndex] -- Dependencies
-                              KernelNodeContents
-  deriving (Show)
-
-instance Storable KernelNodeArg where
-  sizeOf (KernelNodeArg idx) = sizeOf idx
-  alignment (KernelNodeArg idx) = alignment idx
-  peek ptr = KernelNodeArg <$> peek (castPtr ptr) 
-  poke ptr (KernelNodeArg idx) = poke (castPtr ptr) idx
-
-instance Storable NContent where
-  alignment = const 8
-  sizeOf = const 56
-  peek = error "Not implemented"
-  poke ptr n = do
-    pokeByteOff ptr 0 (cnodeType n)
-    case n of
-      (CopyNode _ a1 a2) -> do
-        pokeGeneral a1 a2
-
-      (Input a) -> pokeGeneral a (MIdx 0)
-      (Output a _) -> pokeGeneral a (MIdx 0)
-      (EmptyNode {}) -> pokeGeneral (MIdx 0) (MIdx 0)
-      -- (AllocNode {}) -> 4
-      (KernelNode _ v) -> pokeByteOff ptr 8 v
-    where
-      pokeGeneral :: MIdx -> MIdx -> IO ()
-      pokeGeneral a1 a2 = do
-        pokeByteOff ptr 8 a1
-        pokeByteOff ptr 12 a2
-      
-
-
-instance Storable KernelNodeContents where
-  alignment = const 8
-  sizeOf = const 48
-  peek = error "Not implemented"
-  poke ptr contents = useAsCString (kernelName contents) $ \symbolC ->
-    useAsCString (prepKernelName contents) $ \symbolPrepC -> do
-        argsFP <- mallocForeignPtrArray argCount
-        withForeignPtr argsFP $ \argsPtr -> do
-          pokeArray argsPtr $ kernelArgs contents
-          pokeByteOff ptr 0 (fromIntegral argCount :: Word32)
-          pokeByteOff ptr 8 argsPtr
-          p <- newCString $ modulePath contents
-          pokeByteOff ptr 16 p
-          pokeByteOff ptr 24 symbolC
-          pp <- newCString $ prepModulePath contents
-          pokeByteOff ptr 32 pp
-          pokeByteOff ptr 40 symbolPrepC
-    where
-      argCount = length $ kernelArgs contents
-
-        
-
-cnodeType :: NContent -> Int8
-cnodeType (CopyNode {}) = 0
-cnodeType (Input {}) = 1
-cnodeType (Output {}) = 2
-cnodeType (EmptyNode {}) = 3
--- cnodeType (AllocNode {}) = 4
-cnodeType (KernelNode {}) = 5
-
-addDeps :: NContent -> [NIndex] -> NContent
-addDeps (EmptyNode deps) = EmptyNode . (deps ++ )
-addDeps (Output a deps) = Output a . (deps ++ )
-addDeps (CopyNode deps f t) = \d -> CopyNode (deps ++ d) f t
-addDeps (Input a) = const $ Input a
--- addDeps (AllocNode a bs dims deps) = AllocNode a bs dims . (deps ++)
-addDeps (KernelNode deps c) = \d -> KernelNode (deps ++ d) c
-
-
-getDeps :: NContent -> [NIndex]
-getDeps (EmptyNode deps) = deps
-getDeps (Output _ deps) = deps
-getDeps (CopyNode deps _ _ ) = deps
-getDeps (Input _) = []
--- getDeps (AllocNode _ _ _ deps) = deps
-getDeps (KernelNode deps _) = deps
 
 linkProgram :: UniformScheduleFun PTXKernel () f -> GraphProgram
 linkProgram = convertFun
@@ -281,7 +175,10 @@ convertBody s@(ConvState {..}) env schedule prev = let
       prepObj = unsafePerformIO $ evalPTX defaultTarget $ compilePrep (snd kernelPrepGen) (fst kernelPrepGen) (env, args)
 
       argList = KernelNodeArg <$> prjKernelArgs args env 
-      content = trace (show argList) $ trace (objPath prepObj) $ KernelNodeContents argList (objPath obj) (objSym obj) (objPath prepObj) (objSym prepObj)
+      content = trace (show argList) $ trace (objPath prepObj) $ KernelNodeContents 
+        argList 
+        (KernelPhase (objPath obj) (objSym obj)) 
+        (KernelPhase (objPath prepObj) (objSym prepObj))
 
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
       -- Dependency sets link from first input to first output
@@ -354,9 +251,6 @@ instance Show GraphProgram where
 prettyPrintMap :: (Ord k, Show k, Show v) => M.Map k v -> String
 prettyPrintMap m = unlines $ map (\k -> show k ++ ": " ++ show (m M.! k)) $ M.keys m
 
-
-instance Show NIndex where
-  show (NodeIndex i) = "n" ++ show i
 
 data HostAllocation where
   ScalarAllocation :: Buffer t -> HostAllocation
@@ -457,7 +351,8 @@ runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
         pokeArray node_dependency_counts_c node_dependency_counts
 
         withForeignPtr node_contents_fp $ \node_contents_c -> do
-          pokeArray node_contents_c (ascElems n)
+          pokeArray node_contents_c (WStorable <$> ascElems n)
+
           withForeignPtr bytesizes_fp $ \bytesizes_c -> do
             pokeArray bytesizes_c bytesizes'
 
@@ -487,7 +382,7 @@ runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
 
 
                           putStrLn "starting C runtime from haskell.."
-                          run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c node_contents_c alloc_count_c mem_bytesize_c mem_offsets_c mem_types_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
+                          run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c (castPtr node_contents_c) alloc_count_c mem_bytesize_c mem_offsets_c mem_types_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
                           putStrLn "waiting.."
                           _ <- takeMVar doneMVar
                           putStrLn "Done!"

@@ -11,11 +11,11 @@ typedef enum {MEM_SCALAR, MEM_BUFFER} MemType;
 
 
 struct NodeContent {
-    int8_t node_type; // Size 1, alignment 1
+    int32_t node_type; // Size 1, alignment 1
     union {
         struct {
-            uint32_t arg_count; // Size 8, alignment 8
-            uint32_t *arg_indices; // Size 8, alignment 8
+            uint32_t arg_count; // Size 4, alignment 4
+            uint32_t *arg_indices; // Size 4, alignment 4
             char *module_path; // Size 8, alignment 8
             char *symbol; // Size 8, alignment 8
             char *prep_module_path; // Size 8, aligment 8

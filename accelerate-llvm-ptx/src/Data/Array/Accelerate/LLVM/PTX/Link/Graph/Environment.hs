@@ -16,6 +16,8 @@ import Data.Array.Accelerate.Representation.Elt
 import Foreign
 import Data.Array.Accelerate.AST.Environment
 import Data.Maybe (maybeToList)
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Marshal (MarshalToC (..))
+import Debug.Trace
 
 data GraphEnv t where
   ScalarVal :: MIdx -> !(ScalarType t) -> GraphEnv t
@@ -108,11 +110,16 @@ instance Distributes GraphEnv where
   pairImpossible (ScalarVal _ tp) = pairImpossible tp
   unitImpossible (ScalarVal _ tp) = unitImpossible tp
 
-instance Storable MIdx where
-  sizeOf = const (sizeOf (0 :: Int32))
-  alignment = const (alignment (0 :: Int32))
-  peek p = MIdx <$> peek (castPtr p)
-  poke p (MIdx v) = poke (castPtr p) v
+-- instance Storable MIdx where
+--   sizeOf = const (sizeOf (0 :: Int32))
+--   alignment = const (alignment (0 :: Int32))
+--   peek p = MIdx <$> peek (castPtr p)
+--   poke p (MIdx v) = poke (castPtr p) v
+
+instance MarshalToC MIdx where
+  marshalSize = const (sizeOf (0 :: Int32))
+  marshalAlignment = const (alignment (0 :: Int32))
+  marshalWrite p (MIdx v) = trace ("writing " ++ show v) $  poke (castPtr p) v
 
 instance Storable MEntryType where
   sizeOf = const (sizeOf (0 :: Int8))
