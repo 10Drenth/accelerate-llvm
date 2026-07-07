@@ -7,8 +7,26 @@
 struct NodeContent;
 struct KernelPhase;
 struct GraphProgram;
+struct KernelData;
+struct BuildState;
 typedef enum {NODE_COPY, NODE_INPUT, NODE_OUTPUT, NODE_EMPTY, NODE_ALLOC, NODE_KERNEL} NodeType;
 typedef enum {MEM_SCALAR, MEM_BUFFER} MemType;
+
+
+struct BuildState {
+    CUgraph graph;
+    CUcontext ctx;
+
+    char *mem;
+    uint32_t *mem_offsets;
+    CUdeviceptr *dev_pointers;
+
+    uint32_t *bytesizes;
+
+    CUgraphNode *current_node;
+    size_t dependency_count;
+    CUgraphNode *dependencies;
+};
 
 struct KernelPhase {
     char *module_path; // Size 8, alignment 8
@@ -18,15 +36,17 @@ struct KernelPhase {
     int32_t shared_memory_bytes;
 };
 
+struct KernelData{
+    uint32_t arg_count; // Size 4, alignment 4
+    uint32_t *arg_indices; // Size 4, alignment 4
+    struct KernelPhase main_phase;
+    struct KernelPhase prep_phase;
+}; // Size 48, alignment 8
+
 struct NodeContent {
     int32_t node_type; // Size 1, alignment 1
     union {
-        struct {
-            uint32_t arg_count; // Size 4, alignment 4
-            uint32_t *arg_indices; // Size 4, alignment 4
-            struct KernelPhase main_phase;
-            struct KernelPhase prep_phase;
-        } kernel; // Size 48, alignment 8
+        struct KernelData kernel; 
         struct {
             uint32_t alloc_1;
             uint32_t alloc_2;
@@ -76,5 +96,7 @@ void run_graph
     , char **input_data
     , char **output_data
     , void **output_mvars
-    , void *done_mvar)
-    ;
+    , void *done_mvar
+    );
+
+void add_kernel_node(struct BuildState state, struct KernelData data);

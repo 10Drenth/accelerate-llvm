@@ -39,7 +39,8 @@ extra-source-files:
 
 Library
   c-sources:
-      ./cbits/graph.c
+      ./cbits/graph/graph.c
+      ./cbits/graph/kernel.c
   cc-options: -O2 -Wall -Wextra -DCUDA_PRELOAD
 
   exposed-modules:
