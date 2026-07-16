@@ -9,7 +9,7 @@ struct NodeWriteOutputParams{
 };
 
 struct KernelArguments{
-    uint32_t *argument_indeces;
+    uint32_t *argument_indices;
     size_t argument_count;
 };
 
@@ -31,10 +31,12 @@ void run_graph
     , uint32_t *node_dependency_counts
     , uint32_t **node_dependencies
     , struct NodeContent *node_contents
+    , uint32_t max_sizes
+    , uint32_t *size_indices
     , uint32_t allocation_count
     , uint32_t mem_bytesize
     , uint32_t *mem_offsets
-    , int8_t * mem_types
+    , int8_t *mem_types
     , uint32_t *input_bytesizes
     , char **input_data
     , char **output_data
@@ -48,6 +50,7 @@ void run_graph
     printf("\nSome content content info: size %lu, alignment: %lu\n", sizeof(node_contents[0].content), _Alignof(sizeof(node_contents[0].content)));
     printf("\nSome kernel content info: size %lu, alignment: %lu\n", sizeof(node_contents[0].content.kernel), _Alignof(sizeof(node_contents[0].content.kernel)));
     printf("\nSome kernelphase info: size %lu, alignment: %lu\n", sizeof(struct KernelPhase), _Alignof(struct KernelPhase));
+    printf("\nSome AllocData info: size %lu, alignment: %lu\n", sizeof(struct AllocData), _Alignof(struct AllocData));
 
     printf("\nSome mem info: total size: %d, devpointer alignment: %lu \n", mem_bytesize, _Alignof(CUdeviceptr));
 
@@ -129,43 +132,22 @@ void run_graph
     printf("\nAllocating device pointers");
     CUdeviceptr *dev_pointers = (CUdeviceptr *)malloc(allocation_count * sizeof(CUdeviceptr));
 
+    printf("\nAllocating sizes array, max sizes: %u", max_sizes);
+    CUdeviceptr sizes_d;
+    CU_CHECK(cuMemAlloc(&sizes_d, (max_sizes + 1) * sizeof(CUdeviceptr)));
+    uint32_t *sizes = (uint32_t *)sizes_d;
+
     struct BuildState state;
     memset(&state, 0, sizeof(state));
     state.graph = graph;
     state.ctx = cuContext;
+    state.sizes = sizes;
     state.mem = mem;
     state.mem_offsets = mem_offsets;
-    state.dev_pointers = dev_pointers;
+    state.size_indices = size_indices;
     state.bytesizes = input_bytesizes;
 
-    
-    for (size_t i = 0; i < allocation_count; i++)
-    {
-        printf("\n PreAllocating device pointer %ld", i);
-        if (mem_types[i] == MEM_BUFFER){
-            printf("\n %ld Is a buffer", i);
-            CUdeviceptr alloc_ptr;
-            CU_CHECK(cuMemAlloc(&alloc_ptr, state.bytesizes[i]));
-            CUdeviceptr init_dest_ptr = (CUdeviceptr)(state.mem + state.mem_offsets[i]);
-            printf("\nMem adress (device): %llu", mem_ptr_d);
-            printf("\nOffset: %d", state.mem_offsets[i]);
-            printf("\nDestination adress: %llu", init_dest_ptr);
-            state.dev_pointers[i] = alloc_ptr;
-            CU_CHECK(cuMemcpyHtoD((CUdeviceptr)(state.mem + state.mem_offsets[i]), (void *)&alloc_ptr, sizeof(CUdeviceptr)));
-        }   
-    }
-
-
     printf("\nDone allocating device pointers");
-
-    CUmodule mod_alloc;
-    printf("\nLoading module");
-    CU_CHECK(cuModuleLoad(&mod_alloc, "/home/mdrenth/remote/cuda_id/alloc_kernel.ptx"));
-    printf("\n Succesfully loaded alloc module");
-    printf("\nGetting Function");
-    CUfunction alloc_kernel_func;
-    CU_CHECK(cuModuleGetFunction(&alloc_kernel_func, mod_alloc, "id_kern"));
-    printf("\nSetting up parameters");
 
     size_t output_node_count = 0;
     for (size_t i = 0; i < node_count; i++){
@@ -181,10 +163,7 @@ void run_graph
     size_t output_node_index = 0;
     CUgraphNode *nodes = malloc(node_count * sizeof(CUgraphNode));
 
-    
-
-
-    
+        
     for (size_t i = 0; i < node_count; i++)
     {
         printf("\n\n");
@@ -207,6 +186,8 @@ void run_graph
         switch (content.node_type)
         {
         case NODE_COPY:
+            printf("\nCopy nodes are deprecated");
+            exit(1);
             CUDA_MEMCPY3D cpy_params_cpy;
             uint32_t cp_id1 = content.content.general.alloc_1;
             uint32_t cp_id2 = content.content.general.alloc_2;
@@ -214,14 +195,14 @@ void run_graph
             printf("Copy from %d to %d", cp_id1, cp_id2);
             cpy_params_cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
             
-            cpy_params_cpy.srcDevice = (CUdeviceptr)(state.mem + state.mem_offsets[cp_id1]);
-            if (mem_types[cp_id1] == MEM_BUFFER){
-                cpy_params_cpy.srcDevice = state.dev_pointers[cp_id1];
-            }
-            cpy_params_cpy.dstDevice = (CUdeviceptr)(state.mem + state.mem_offsets[cp_id2]);
-            if (mem_types[cp_id2] == MEM_BUFFER){
-                cpy_params_cpy.dstDevice = state.dev_pointers[cp_id2];
-            }
+            // cpy_params_cpy.srcDevice = (CUdeviceptr)(state.mem + state.mem_offsets[cp_id1]);
+            // if (mem_types[cp_id1] == MEM_BUFFER){
+            //     cpy_params_cpy.srcDevice = state.dev_pointers[cp_id1];
+            // }
+            // cpy_params_cpy.dstDevice = (CUdeviceptr)(state.mem + state.mem_offsets[cp_id2]);
+            // if (mem_types[cp_id2] == MEM_BUFFER){
+            //     cpy_params_cpy.dstDevice = state.dev_pointers[cp_id2];
+            // }
 
             cpy_params_cpy.srcPitch = (size_t)state.bytesizes[cp_id1];
             cpy_params_cpy.srcHeight = 1;
@@ -238,28 +219,38 @@ void run_graph
             CUDA_MEMCPY3D cpy_params_input;
             memset(&cpy_params_input, 0, sizeof(cpy_params_input));
             uint32_t input_alloc = content.content.general.alloc_1;
-            uint32_t input_size = state.bytesizes[input_alloc] / 8;
+
             
+            uint32_t input_size = state.bytesizes[input_alloc] / 8;
             printf("Input to %d", input_alloc);
             printf("\nInput value: size = %d, value = ", input_size);
-            
             for (uint32_t c = 0; c < input_size; c++){
                 printf("%lu", ((uint64_t* )input_data[input_alloc])[c]);
             }
-            printf("\nMem adress: %llu", mem_ptr_d);
-            printf("\nOffset: %d", state.mem_offsets[input_alloc]);
-            CUdeviceptr input_device_dest = (CUdeviceptr)(state.mem + state.mem_offsets[input_alloc]);
+            
+            CUdeviceptr init_dest_ptr = (CUdeviceptr)(state.mem + state.mem_offsets[input_alloc]);
+
+            printf("\n PreAllocating device pointer %u", input_alloc);
             if (mem_types[input_alloc] == MEM_BUFFER){
-                input_device_dest = state.dev_pointers[input_alloc];
-            }
-            printf("\nDestination adress: %llu", input_device_dest);
+                printf("\n%u Is a buffer of size %u", input_alloc, state.bytesizes[input_alloc]);
+                CUdeviceptr alloc_ptr;
+                CU_CHECK(cuMemAlloc(&alloc_ptr, state.bytesizes[input_alloc]));
+                printf("\nMem adress (device): %llu", mem_ptr_d);
+                printf("\nOffset: %d", state.mem_offsets[input_alloc]);
+                printf("\nDestination adress: %llu", init_dest_ptr);
+                CU_CHECK(cuMemcpyHtoD((CUdeviceptr)(state.mem + state.mem_offsets[input_alloc]), (void *)&alloc_ptr, sizeof(CUdeviceptr)));
+                
+                printf("\nSize index: %u", state.size_indices[input_alloc]);
+                CUdeviceptr size_d = (CUdeviceptr)(state.sizes + state.size_indices[input_alloc] * sizeof(uint32_t));
+                CU_CHECK(cuMemcpyHtoD(size_d, (void *)&state.bytesizes[input_alloc], sizeof(uint32_t)));
+            }   
 
             cpy_params_input.srcMemoryType = CU_MEMORYTYPE_HOST;
             cpy_params_input.srcHost = (void *)input_data[input_alloc];
             cpy_params_input.srcPitch = (size_t)state.bytesizes[input_alloc];
             cpy_params_input.srcHeight = 1;
             cpy_params_input.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy_params_input.dstDevice = input_device_dest;
+            cpy_params_input.dstDevice = init_dest_ptr;
             cpy_params_input.dstPitch = (size_t)state.bytesizes[input_alloc];
             cpy_params_input.dstHeight = 1;
             cpy_params_input.WidthInBytes = (size_t)state.bytesizes[input_alloc];
@@ -269,58 +260,105 @@ void run_graph
             printf("\nInput End");
             break;
         case NODE_OUTPUT:
-            CUgraphNode copy_node;
+            // CUgraphNode copy_node;
 
-            uint32_t output_alloc = content.content.general.alloc_1;
+            // uint32_t output_alloc = content.content.general.alloc_1;
 
-            void *output_adress;
-            CU_CHECK(cuMemAllocHost(&output_adress, state.bytesizes[output_alloc]));
+            // state.bytesizes[output_alloc] = 8;
+            // void *output_adress;
+            // CU_CHECK(cuMemAllocHost(&output_adress, state.bytesizes[output_alloc]));
             
-            CUdeviceptr output_device_src = (CUdeviceptr)(state.mem + state.mem_offsets[output_alloc]);
-            if (mem_types[output_alloc] == MEM_BUFFER){
-                output_device_src = state.dev_pointers[output_alloc];
-            }
+            // CUdeviceptr output_device_src = (CUdeviceptr)(state.mem + state.mem_offsets[output_alloc]);
+            // if (mem_types[output_alloc] == MEM_BUFFER){
+            //     output_device_src = state.dev_pointers[output_alloc];
+            // }
 
-            CUDA_MEMCPY3D cpy_params_output;
-            memset(&cpy_params_output, 0, sizeof(cpy_params_output));
-            printf("Output from %d, size is %d", output_alloc, state.bytesizes[output_alloc]);
-            cpy_params_output.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy_params_output.srcDevice = output_device_src;
-            cpy_params_output.srcPitch = (size_t)state.bytesizes[output_alloc];
-            cpy_params_output.srcHeight = 1;
-            cpy_params_output.dstMemoryType = CU_MEMORYTYPE_HOST;
-            cpy_params_output.dstHost = output_adress;
-            cpy_params_output.dstPitch = (size_t)state.bytesizes[output_alloc];
-            cpy_params_output.dstHeight = 1;
-            cpy_params_output.WidthInBytes = (size_t)state.bytesizes[output_alloc];
-            cpy_params_output.Height = 1;
-            cpy_params_output.Depth = 1;
-            CU_CHECK(cuGraphAddMemcpyNode(&copy_node, state.graph, state.dependencies, state.dependency_count, &cpy_params_output, state.ctx));
+            // CUDA_MEMCPY3D cpy_params_output;
+            // memset(&cpy_params_output, 0, sizeof(cpy_params_output));
+            // printf("Output from %d, size is %d", output_alloc, state.bytesizes[output_alloc]);
+            // cpy_params_output.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            // cpy_params_output.srcDevice = output_device_src;
+            // cpy_params_output.srcPitch = (size_t)state.bytesizes[output_alloc];
+            // cpy_params_output.srcHeight = 1;
+            // cpy_params_output.dstMemoryType = CU_MEMORYTYPE_HOST;
+            // cpy_params_output.dstHost = output_adress;
+            // cpy_params_output.dstPitch = (size_t)state.bytesizes[output_alloc];
+            // cpy_params_output.dstHeight = 1;
+            // cpy_params_output.WidthInBytes = (size_t)state.bytesizes[output_alloc];
+            // cpy_params_output.Height = 1;
+            // cpy_params_output.Depth = 1;
+            // CU_CHECK(cuGraphAddMemcpyNode(&copy_node, state.graph, state.dependencies, state.dependency_count, &cpy_params_output, state.ctx));
 
-            CUDA_HOST_NODE_PARAMS hostParams;
-            memset(&hostParams, 0, sizeof(hostParams));
+            // CUDA_HOST_NODE_PARAMS hostParams;
+            // memset(&hostParams, 0, sizeof(hostParams));
 
-            memset(&outputParams[output_node_index], 0, sizeof(struct NodeWriteOutputParams));
-            outputParams[output_node_index].bytesize = (size_t)state.bytesizes[output_alloc];
-            outputParams[output_node_index].done_mvar = output_mvars[output_alloc];
-            outputParams[output_node_index].write_adress = (void *)output_data[output_alloc];
-            outputParams[output_node_index].read_adress = output_adress;
+            // memset(&outputParams[output_node_index], 0, sizeof(struct NodeWriteOutputParams));
+            // outputParams[output_node_index].bytesize = (size_t)state.bytesizes[output_alloc];
+            // outputParams[output_node_index].done_mvar = output_mvars[output_alloc];
+            // outputParams[output_node_index].write_adress = (void *)output_data[output_alloc];
+            // outputParams[output_node_index].read_adress = output_adress;
 
-            hostParams.userData = (void *)(&outputParams[output_node_index]);
-            hostParams.fn = node_write_output;
+            // hostParams.userData = (void *)(&outputParams[output_node_index]);
+            // hostParams.fn = node_write_output;
 
-            CU_CHECK(cuGraphAddHostNode(state.current_node, state.graph, &copy_node, 1, &hostParams));
-            output_node_index += 1;
-            break;
+            // CU_CHECK(cuGraphAddHostNode(state.current_node, state.graph, &copy_node, 1, &hostParams));
+            // output_node_index += 1;
+            // break;
         case NODE_EMPTY:
             printf("Empty");
             CU_CHECK(cuGraphAddEmptyNode(state.current_node, state.graph, state.dependencies, state.dependency_count));
             break;
         case NODE_ALLOC: // TODO: Remove placeholder
-            printf("Alloc");
+            printf("\nAlloc:");
+            struct AllocData alloc_data = content.content.alloc_data;
+            uint32_t a_arg_count = alloc_data.arg_count;
+            uint32_t *a_arg_indices = alloc_data.arg_indices;
+            printf("\nIterating over %d parameters: ", a_arg_count);
+            for (size_t a_idx = 0; a_idx < a_arg_count; a_idx++){
+                printf("%d, ", a_arg_indices[a_idx]);
+            }
+            printf("\nwrite destination: %u", alloc_data.write_index);
+            struct KernelPhase data = content.content.alloc_data.alloc_kernel;
+            printf("\nKernel module: %s", data.module_path);
+            printf("\nKernel symbol: %s", data.symbol);
+
+            printf("\n\nLoading alloc kernel");
+            CUDA_KERNEL_NODE_PARAMS alloc_node_params = load_ptx_kernel(state, &data);
+    
+            printf("\nAllocating input dims struct");
+            size_t dims_ptr_struct_size = a_arg_count * sizeof(CUdeviceptr);
+            CUdeviceptr dims_idxs_d;
+            if (a_arg_count > 0){
+                CU_CHECK(cuMemAlloc(&dims_idxs_d, dims_ptr_struct_size));
+                CUdeviceptr *dims_idxs_h = malloc(dims_ptr_struct_size);
+
+                for (size_t a_idx = 0; a_idx < a_arg_count; a_idx++)
+                {   // TODO: This should account for alignment
+                    dims_idxs_h[a_idx] = (CUdeviceptr)(state.mem + state.mem_offsets[a_arg_indices[a_idx]]);
+                }
+                CU_CHECK(cuMemcpyHtoD(dims_idxs_d, dims_idxs_h, dims_ptr_struct_size));
+            }
+            else{
+                CU_CHECK(cuMemAlloc(&dims_idxs_d, sizeof(CUdeviceptr)));
+            }
+            CUdeviceptr alloc_dest = (CUdeviceptr)(state.mem + state.mem_offsets[alloc_data.write_index]);
+            CUdeviceptr alloc_sz_dest = (CUdeviceptr)(state.sizes + state.size_indices[alloc_data.write_index] * sizeof(uint32_t));
+            printf("\nAlloc destination: %llu", alloc_dest);
+
+            void *alloc_args[] = {&dims_idxs_d, &alloc_dest, &alloc_sz_dest};
+            alloc_node_params.kernelParams = alloc_args;
+
+            CUdevice all_ptr;
+            CU_CHECK(cuMemAlloc(&all_ptr, 8));
+            CU_CHECK(cuMemcpyHtoD(alloc_dest, (void *)&all_ptr, sizeof(CUdeviceptr)));
+
             CU_CHECK(cuGraphAddEmptyNode(state.current_node, state.graph, state.dependencies, state.dependency_count));
+
+            // CU_CHECK(cuGraphAddKernelNode(state.current_node, state.graph, state.dependencies, state.dependency_count, &alloc_node_params));
             break;
-        case NODE_KERNEL: // TODO: Remove placeholder
+        case NODE_KERNEL:
+            // CU_CHECK(cuGraphAddEmptyNode(state.current_node, state.graph, state.dependencies, state.dependency_count));
+
             add_kernel_node(state, content.content.kernel);
             break;
         default:
@@ -371,6 +409,8 @@ void run_graph
     printf("\n\nSynchronizing.\n");
     CU_CHECK(cuStreamSynchronize(0));
     printf("\n\nGraph Done.\n");
+
+    // TODO: Copy back output values
 
     hs_try_putmvar(-1, done_mvar);
 }

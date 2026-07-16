@@ -8,6 +8,7 @@ struct NodeContent;
 struct KernelPhase;
 struct GraphProgram;
 struct KernelData;
+struct AllocData;
 struct BuildState;
 typedef enum {NODE_COPY, NODE_INPUT, NODE_OUTPUT, NODE_EMPTY, NODE_ALLOC, NODE_KERNEL} NodeType;
 typedef enum {MEM_SCALAR, MEM_BUFFER} MemType;
@@ -19,9 +20,10 @@ struct BuildState {
 
     char *mem;
     uint32_t *mem_offsets;
-    CUdeviceptr *dev_pointers;
+    uint32_t *size_indices;
 
     uint32_t *bytesizes;
+    uint32_t *sizes;
 
     CUgraphNode *current_node;
     size_t dependency_count;
@@ -31,22 +33,30 @@ struct BuildState {
 struct KernelPhase {
     char *module_path; // Size 8, alignment 8
     char *symbol; // Size 8, alignment 8
-    int32_t thread_block_size;
-    int32_t grid_size;
-    int32_t shared_memory_bytes;
-};
+    int32_t thread_block_size; // Size 4, alignment 4
+    int32_t grid_size; // Size 4, alignment 4
+    int32_t shared_memory_bytes; // Size 4, alignment 4
+}; // Size 32, alignment 8
 
 struct KernelData{
     uint32_t arg_count; // Size 4, alignment 4
-    uint32_t *arg_indices; // Size 4, alignment 4
-    struct KernelPhase main_phase;
-    struct KernelPhase prep_phase;
+    uint32_t *arg_indices; // Size 8, alignment 8
+    struct KernelPhase main_phase; // Size 32, alignment 8
+    struct KernelPhase prep_phase; // Size 32, alignment 8
+}; // Size 80, alignment 8
+
+struct AllocData{
+    uint32_t write_index; // Size 4, alignment 4
+    uint32_t arg_count; // Size 4, alignment 4
+    uint32_t *arg_indices; // Size 8, alignment 8
+    struct KernelPhase alloc_kernel; // Size 32, alignment 8
 }; // Size 48, alignment 8
 
 struct NodeContent {
     int32_t node_type; // Size 1, alignment 1
     union {
         struct KernelData kernel; 
+        struct AllocData alloc_data;
         struct {
             uint32_t alloc_1;
             uint32_t alloc_2;
@@ -59,28 +69,6 @@ struct NodeContent {
 }; // Size 56, alignment 8
 
 
-struct GraphProgram {
-    // Graph definition
-    uint32_t node_count;
-    uint32_t *node_dependency_counts;
-    uint32_t **node_dependencies;
-    struct NodeContent *node_contents;
-
-    uint32_t allocation_count;
-    uint32_t *allocation_sizes;
-    
-    // Graph input
-    // uint8_t *input_data;
-    void **input_data;
-    
-    // TODO
-    // Graph output
-    void **output_mvars;
-    void **output_data;
-
-    void *done_mvar;
-};
-
 void hs_try_putmvar(int32_t, void*);
 
 void run_graph
@@ -88,6 +76,8 @@ void run_graph
     , uint32_t *node_dependency_counts
     , uint32_t **node_dependencies
     , struct NodeContent *node_contents
+    , uint32_t max_sizes
+    , uint32_t *size_indices
     , uint32_t allocation_count
     , uint32_t mem_bytesize
     , uint32_t *mem_offsets
@@ -99,4 +89,6 @@ void run_graph
     , void *done_mvar
     );
 
+
+CUDA_KERNEL_NODE_PARAMS load_ptx_kernel(struct BuildState state, struct KernelPhase *data);
 void add_kernel_node(struct BuildState state, struct KernelData data);

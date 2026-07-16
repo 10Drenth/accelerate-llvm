@@ -94,6 +94,7 @@ Library
     Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node.Kernel
     Data.Array.Accelerate.LLVM.PTX.Link.Graph.Marshal
     Data.Array.Accelerate.LLVM.PTX.Link.Graph.PrepKernel
+    Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node.AllocKernel
     Data.Array.Accelerate.LLVM.PTX.Link.Graph.Environment
     Data.Array.Accelerate.LLVM.PTX.Link.Cache
     Data.Array.Accelerate.LLVM.PTX.Link.Object
@@ -105,7 +106,9 @@ Library
     Paths_accelerate_llvm_ptx
 
   build-depends:
-          base                          >= 4.10 && < 5
+          llvm-pretty >=0.13.0.0.99
+        , base                          >= 4.10 && < 5
+        , base                          >= 4.10 && < 5
         , accelerate                    == 1.4.*
         , accelerate-llvm               == 1.4.*
         , bytestring                    >= 0.10.4

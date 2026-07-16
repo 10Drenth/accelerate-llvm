@@ -40,8 +40,8 @@ newtype KernelSymbol = KernelSymbol ShortByteString
   deriving (Show)
 
 data KernelPhase = KernelPhase
-  { modulePath :: FilePath
-  , kernelSymbol :: ShortByteString
+  { modulePath :: !FilePath
+  , kernelSymbol :: !ShortByteString
   , threadBlockSize   :: Int32
   , gridSize          :: Int32
   , sharedMemoryBytes :: Int32
@@ -80,23 +80,22 @@ fromPTXKernelPhase phase = let
   }
 
 
-marshalRep
+kernelNodeMarshalRep
   :: KernelNodeContents
-  -> Marshal ( MStorable Word32
-   , Marshal ( Marshal [KernelNodeArg]
-   , Marshal ( KernelPhase
-             , KernelPhase )))
-marshalRep (KernelNodeContents args main prep)
-  = Marshal ( MStorable $ fromIntegral $ length args
-  , Marshal ( Marshal args
-  , Marshal ( main
-            , prep )))
+  -> Marshal MarshalData
+kernelNodeMarshalRep (KernelNodeContents args main prep)
+  = structMarshalData 
+  [ toField (MStorable (fromIntegral $ length args :: Word32))
+  , toField (Marshal args)
+  , toField main
+  , toField prep
+  ]
 
 
 instance MarshalToC KernelNodeContents where
-  marshalSize = marshalSize . marshalRep
-  marshalAlignment = marshalAlignment . marshalRep
-  marshalWrite ptr = marshalWrite (castPtr ptr) . marshalRep
+  marshalSize = marshalSize . kernelNodeMarshalRep
+  marshalAlignment = marshalAlignment . kernelNodeMarshalRep
+  marshalWrite ptr = marshalWrite (castPtr ptr) . kernelNodeMarshalRep
 
 
 instance MarshalToC KernelNodeArg where
@@ -106,17 +105,15 @@ instance MarshalToC KernelNodeArg where
 
 
 kernelPhaseMarshalRep :: KernelPhase
-  -> Marshal ( FilePath
-   , Marshal ( ShortByteString
-   , Marshal ( MStorable Word32
-   , Marshal ( MStorable Word32
-   , MStorable Word32 ))))
+  -> Marshal MarshalData
 kernelPhaseMarshalRep (KernelPhase path symbol tbs gs smem)
-  = Marshal ( path
-  , Marshal ( symbol
-  , Marshal ( MStorable $ fromIntegral tbs
-  , Marshal ( MStorable $ fromIntegral gs
-            , MStorable $ fromIntegral smem ))))
+  = structMarshalData 
+  [ toField path
+  , toField symbol
+  , toField (MStorable (fromIntegral tbs :: Word32))
+  , toField (MStorable (fromIntegral gs :: Word32))
+  , toField (MStorable (fromIntegral smem :: Word32))
+  ]
 
 instance MarshalToC KernelPhase where
   marshalSize = marshalSize . kernelPhaseMarshalRep

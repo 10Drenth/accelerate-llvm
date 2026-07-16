@@ -43,14 +43,15 @@ import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node.Kernel
 import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Marshal (MStorable(MStorable), WStorable (..))
 import Data.Array.Accelerate.Lifetime
+import Data.Array.Accelerate.LLVM.PTX.Link.Graph.Node.AllocKernel (makeAllocNode)
+import Data.String (fromString)
 
 
 
-data GraphProgram = GraphProgram Nodes MemoryMap GraphMemory
+data GraphProgram = GraphProgram Nodes GraphMemory
 
 
 type Nodes = M.Map NIndex NContent
-type MemoryMap = M.Map MIdx [MIdx]
 
 data EventContents = EventContents [NIndex] -- Incoming
                                    [NIndex] -- Outgoing
@@ -66,12 +67,12 @@ convertFun :: forall t. UniformScheduleFun PTXKernel () t -> GraphProgram
 convertFun (Sbody _) = error ""
 convertFun (Slam lhs1 (Slam lhs2 f)) = convertFun (Slam (LeftHandSidePair lhs1 lhs2) f)
 convertFun (Slam lhs (Sbody body)) = let
-  (lhsNodes, s) = convertLHS (lhsToTupR lhs) (ConvState M.empty (0, M.empty) M.empty M.empty)
+  (lhsNodes, s) = convertLHS (lhsToTupR lhs) (ConvState M.empty (0, M.empty) M.empty)
   lhsenv = push' Empty (lhs, lhsNodes)
   s' = convertBody s lhsenv body Nothing
 
   nodes'' = processSignalDependencies (nodes s') (events s')
-  in trace ("events:" ++ prettyPrintMap (events s')) $ GraphProgram nodes'' (memDeps s') (mem s')
+  in trace ("events:" ++ prettyPrintMap (events s')) $ GraphProgram nodes'' (mem s')
 
 processSignalDependencies :: Nodes -> Events -> Nodes
 processSignalDependencies ns es = foldr f ns (M.elems es)
@@ -84,7 +85,6 @@ processSignalDependencies ns es = foldr f ns (M.elems es)
 data ConvState = ConvState
   { nodes :: Nodes
   , mem :: GraphMemory
-  , memDeps :: MemoryMap
   , events :: Events
   }
 
@@ -137,17 +137,21 @@ convertBody s@(ConvState {..}) env schedule prev = let
             (Just v) -> v
             _ -> error "RefWrite invalid value"
 
-          memDeps' = M.adjust (idxIn :) idxOut memDeps
           nodes' = M.insert nodeIdx (CopyNode (maybeToList prev) idxIn idxOut) nodes
 
-          in convertBody s {nodes = nodes', memDeps = memDeps'} env' next (Just nodeIdx)
+          in convertBody s {nodes = nodes'} env' next (Just nodeIdx)
       _ -> error "RefRead invalid value"
 
 -- BEGIN TODO
   (Alet lhs (Alloc sh tp vs) next) -> let
-    (mem', k) = reserveMemory MBuffer (sizeOf (0 :: Int)) (sizeOf (0 :: Int)) mem
+    (mem', k) = reserveBuffer mem
     env' = push' env (lhs, BufferVal k)
-    in convertBody s {mem = mem'} env' next prev
+    
+    nodeContent = makeAllocNode k (fromString $ show mem') (env, sh, vs, tp)
+    
+    nodes' = M.insert nodeIdx (AllocNode (maybeToList prev) nodeContent) nodes
+
+    in convertBody s {mem = mem', nodes = nodes'} env' next (Just nodeIdx)
   (Alet lhs (RefRead rref) next) ->
     case prj' (varIdx rref) env of
       (RefVal rval) -> case reprIsSingle @GraphEnv @_ @GraphEnv rval of
@@ -172,9 +176,8 @@ convertBody s@(ConvState {..}) env schedule prev = let
       content = fromPTXKernel env kernel args
 
       nodes' = M.insert nodeIdx (KernelNode (maybeToList prev) content) nodes
-      -- Dependency sets link from first input to first output
-      memDeps' = M.adjust (MIdx 0 :) (MIdx 1) memDeps
-      in convertBody s {nodes = nodes', memDeps = memDeps'} env next (Just nodeIdx)
+
+      in convertBody s {nodes = nodes'} env next (Just nodeIdx)
 -- END TODO
 
   _ -> error "Unexpected body contents in schedule."
@@ -204,7 +207,6 @@ convertLHS tup s@(ConvState {..}) = let
       )
     , s
       { nodes = M.insert nodeIdx (Input memKey) nodes
-      , memDeps = M.insert memKey [] memDeps
       , events = M.insert eventIdx (EventContents [nodeIdx] []) events
       , mem = mem'
       }
@@ -217,7 +219,6 @@ convertLHS tup s@(ConvState {..}) = let
       )
     , s
       { nodes = M.insert nodeIdx (Output memKey []) nodes
-      , memDeps = M.insert memKey [] memDeps
       , events = M.insert eventIdx (EventContents [] [nodeIdx]) events
       , mem = mem'
       }
@@ -230,14 +231,12 @@ convertLHS tup s@(ConvState {..}) = let
   _ -> error "Unexpected types in the input or output of an Acc function"
 
 instance Show GraphProgram where
-  show (GraphProgram ns as (bs, m)) = "\n\n===Node Graph==\n"
-                                    ++ prettyPrintMap ns
-                                    ++ "\n\n===Data Graph===\n"
-                                    ++ prettyPrintMap as
-                                    ++ "\n\n===Mem offset===\n"
-                                    ++ prettyPrintMap m
-                                    ++ "\nMem bytesize: " ++ show bs
-                                    ++ "\n\n"
+  show (GraphProgram ns (bs, m)) = "\n\n===Node Graph==\n"
+                                ++ prettyPrintMap ns
+                                ++ "\n\n===Mem offset===\n"
+                                ++ prettyPrintMap m
+                                ++ "\nMem bytesize: " ++ show bs
+                                ++ "\n\n"
 
 prettyPrintMap :: (Ord k, Show k, Show v) => M.Map k v -> String
 prettyPrintMap m = unlines $ map (\k -> show k ++ ": " ++ show (m M.! k)) $ M.keys m
@@ -276,9 +275,11 @@ type RunGraphF =
   -> Ptr Word32 -- Node dependency counts
   -> Ptr (Ptr Word32) -- Node dependencies
   -> Ptr NContent -- Node contents
+  -> Word32 -- max sizes
+  -> Ptr Int32 -- size indices
   -> Word32 -- Alloc count
   -> Word32 -- Memory bytesize
-  -> Ptr Word32 -- Memory offsets
+  -> Ptr Int32 -- Memory offsets
   -> Ptr Int8 -- Memory types
   -> Ptr Word32 -- input bytesizes
   -> Ptr (Ptr Word8) -- Input data
@@ -292,7 +293,7 @@ foreign import ccall unsafe "run_graph" run_graph_c
   :: RunGraphF
 
 runGraphProgram :: GraphProgram -> TupR BaseR t -> t -> IO ()
-runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
+runGraphProgram (GraphProgram n mem@(memBytesize, mmap)) tup v = do
 
   p1 <- inspectInputAllocSizes tup v $ Pass1
     { currentIndex = MIdx 0
@@ -302,8 +303,7 @@ runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
     }
 
   putStrLn $ "Input sizes: \n" ++ prettyPrintMap (inputSizes p1)
-  let bytesizes = propagateAllocSizes a (inputSizes p1)
-  putStrLn $ "Propagated sizes: \n" ++ prettyPrintMap bytesizes
+  let bytesizes = inputSizes p1 `M.union` M.map (const 0) mmap
 
   outputBuffers <- allocateHostOutBuffers bytesizes
 
@@ -312,19 +312,24 @@ runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
 
   let
     node_count = M.size n
-    n_nodes_c = (fromIntegral node_count :: Word32)
-    memOffsets' = map fromIntegral $ memoryOffsets mem
-    memTypes' = memoryTypes mem
+    n_nodes_c = fromIntegral node_count
+    memOffsets = map entryOffset $ memEntries mem
+    memSizeIndices = map (\x -> case entrySizeIndex x of (SIdx i) -> i) $ memEntries mem
+    memTypes = map (\x -> case entryType x of  
+        MScalar -> 0
+        MBuffer -> 1
+      ) $ memEntries mem
     bytesizes' = [fromIntegral (bytesizes M.! MIdx (fromIntegral i) ) | i <- [0..(alloc_count-1)]]
-    alloc_count = M.size a
-    alloc_count_c = (fromIntegral alloc_count :: Word32)
-    memEntryCount = length memOffsets'
-    mem_bytesize_c = (fromIntegral memBytesize :: Word32)
+    maxSIdx = maxSizeIndex mem
+    alloc_count = length $ memIdxs mem
+    alloc_count_c = fromIntegral alloc_count
+    memEntryCount = length memOffsets
+    mem_bytesize_c = fromIntegral memBytesize
     (node_dependency_counts, node_dependencies) = getNodeDependencies n
-    n_outputs = M.size (outputWriteOps p1)
-
+  
   node_dependency_counts_fp <- mallocForeignPtrArray node_count
   node_contents_fp <- mallocForeignPtrArray node_count
+  sz_indices_fp <- mallocForeignPtrArray memEntryCount
   mem_offsets_fp <- mallocForeignPtrArray memEntryCount
   mem_types_fp <- mallocForeignPtrArray memEntryCount
   bytesizes_fp <- mallocForeignPtrArray alloc_count
@@ -344,41 +349,44 @@ runGraphProgram (GraphProgram n a mem@(memBytesize, _)) tup v = do
         withForeignPtr node_contents_fp $ \node_contents_c -> do
           pokeArray node_contents_c (WStorable <$> ascElems n)
 
-          withForeignPtr bytesizes_fp $ \bytesizes_c -> do
-            pokeArray bytesizes_c bytesizes'
+          withForeignPtr sz_indices_fp $ \sz_indices_c -> do
+            pokeArray sz_indices_c memSizeIndices
 
-            withForeignPtr mem_offsets_fp $ \mem_offsets_c -> do
-              pokeArray mem_offsets_c memOffsets'
-            
-              withForeignPtr mem_types_fp $ \mem_types_c -> do
-                pokeArray mem_types_c memTypes'
+            withForeignPtr bytesizes_fp $ \bytesizes_c -> do
+              pokeArray bytesizes_c bytesizes'
 
-                withFps (map getHostAllocFp (ascElems (inputValues p1))) $ \input_data_ptrs -> do
-                  withForeignPtr input_data_fp $ \input_data_c -> do
-                    pokeArray input_data_c input_data_ptrs
-                    withFps (map getHostAllocFp (ascElems outputBuffers)) $ \output_data_ptrs -> do
-                      withForeignPtr output_mvars_fp $ \output_mvars_c -> do
-                        mvars <- mapM (\aid -> do
-                            mvar <- newEmptyMVar
-                            case outputWriteOps p1 M.!? aid of
-                              (Just op) -> op mvar outputBuffers
-                              Nothing -> return ()
-                            return mvar
-                            ) (M.keys a)
-                        mvarPtrs <- mapM newStablePtrPrimMVar mvars
-                        pokeArray output_mvars_c mvarPtrs
+              withForeignPtr mem_offsets_fp $ \mem_offsets_c -> do
+                pokeArray mem_offsets_c memOffsets
+              
+                withForeignPtr mem_types_fp $ \mem_types_c -> do
+                  pokeArray mem_types_c memTypes
 
-                        withForeignPtr output_data_fp $ \output_data_c -> do
-                          pokeArray output_data_c output_data_ptrs
+                  withFps (map getHostAllocFp (ascElems (inputValues p1))) $ \input_data_ptrs -> do
+                    withForeignPtr input_data_fp $ \input_data_c -> do
+                      pokeArray input_data_c input_data_ptrs
+                      withFps (map getHostAllocFp (ascElems outputBuffers)) $ \output_data_ptrs -> do
+                        withForeignPtr output_mvars_fp $ \output_mvars_c -> do
+                          mvars <- mapM (\aid -> do
+                              mvar <- newEmptyMVar
+                              case outputWriteOps p1 M.!? aid of
+                                (Just op) -> op mvar outputBuffers
+                                Nothing -> return ()
+                              return mvar
+                              ) (memIdxs mem)
+                          mvarPtrs <- mapM newStablePtrPrimMVar mvars
+                          pokeArray output_mvars_c mvarPtrs
+
+                          withForeignPtr output_data_fp $ \output_data_c -> do
+                            pokeArray output_data_c output_data_ptrs
 
 
-                          putStrLn "starting C runtime from haskell.."
-                          run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c (castPtr node_contents_c) alloc_count_c mem_bytesize_c mem_offsets_c mem_types_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
-                          putStrLn "waiting.."
-                          _ <- takeMVar doneMVar
-                          putStrLn "Done!"
-                          mapM_ (`putMVar` ()) mvars
-                          putStrLn "Done resolving outputs!"
+                            putStrLn "starting C runtime from haskell.."
+                            run_graph_c n_nodes_c node_dependency_counts_c nodes_deps_c (castPtr node_contents_c) (fromIntegral $ sIdx maxSIdx) sz_indices_c alloc_count_c mem_bytesize_c mem_offsets_c mem_types_c bytesizes_c input_data_c output_data_c output_mvars_c doneMVarPtr
+                            putStrLn "waiting.."
+                            _ <- takeMVar doneMVar
+                            putStrLn "Done!"
+                            mapM_ (`putMVar` ()) mvars
+                            putStrLn "Done resolving outputs!"
 
 
 
@@ -492,12 +500,3 @@ getValue :: MIdx -> M.Map MIdx HostAllocation -> Buffer e
 getValue idx m = case m M.! idx of BufferAllocation (Buffer p) -> Buffer (castForeignPtr p)
                                    ScalarAllocation (Buffer p) -> Buffer (castForeignPtr p)
 
-
-
-propagateAllocSizes :: MemoryMap -> M.Map MIdx Int -> M.Map MIdx Int
-propagateAllocSizes deps sizes | all (`M.member` sizes) (M.keys deps) = sizes
-                               | otherwise = let
-                                  remainingKeys = filter (\k -> not (M.member k sizes)) (M.keys deps)
-                                  withSizes = zip remainingKeys (map (\k -> mapMaybe (sizes M.!?) (deps M.! k)) remainingKeys)
-                                  nonEmpty = map (second head) $ filter (not . null . snd) withSizes
-                                  in M.union sizes (M.fromList nonEmpty)
